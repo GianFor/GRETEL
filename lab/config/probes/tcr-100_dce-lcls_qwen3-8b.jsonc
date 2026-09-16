@@ -42,7 +42,8 @@
                     "seed": 0,
                     "max_new_tokens": 1024,
                     "enable_thinking": false,
-                    "gpu_memory_utilization": 0.5
+                    "gpu_memory_utilization": 0.3,
+                    "max_model_len": 8192
                 }
             }
         }
