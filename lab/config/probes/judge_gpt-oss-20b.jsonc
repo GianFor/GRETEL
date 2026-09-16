@@ -1,0 +1,25 @@
+// Pilot, second pass: score the RECONSTRUCTION probe over the dumps of the
+// first pass with gpt-oss-20b as the judge (~16 GB, MXFP4 checkpoint).
+//   python scripts/run_probes.py --config lab/config/probes/judge_gpt-oss-20b.jsonc \
+//                                --results lab/output/results/probes-pilot
+{
+    "experiment": {"scope": "probes-pilot"},
+    "compose_strs": "./lab/config/snippets/default_store_paths.json",
+    "judge_name": "gpt-oss-20b",
+    "judge": {
+        "class": "src.LLMexplaneability.huggingface.HuggingFaceLLM",
+        "parameters": {
+            "model": "openai/gpt-oss-20b",
+            "engine": "vllm",
+            "temperature": 0.0,
+            "seed": 0,
+            "max_new_tokens": 1024,
+            "reasoning_effort": "low",
+            "gpu_memory_utilization": 0.5
+        }
+    },
+    "conditions": [
+        {"context": "off", "mode": "full"},
+        {"context": "on", "mode": "full"}
+    ]
+}
