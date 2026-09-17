@@ -1,4 +1,5 @@
-// Pilot, first pass: Tree-Cycles (100 graphs, ~10 in test per fold), DCE seed
+// Pilot, first pass: Tree-Cycles (100 graphs of 64 nodes, seeded generator so the
+// cached splits always match the graphs, ~10 in test per fold), DCE seed
 // counterfactual minimized by LocalSearch, narratives by Qwen3-8B under vllm.
 // Writes lab/output/results/probes-pilot/.../cf_per_instance/fold_0/cf_<id>.json
 // with the typed delta (seed and minimized) and the direct/inverse narratives.
@@ -17,7 +18,19 @@
     },
     "doe-triplets": [
         {
-            "compose_do": "./lab/config/snippets/do-pairs/ablation-TCR-100-64-0.40_TCO.json",
+            "dataset": {
+                "class": "src.dataset.dataset_base.Dataset",
+                "parameters": {
+                    "generator": {
+                        "class": "src.dataset.generators.treecycles_seeded.TreeCyclesSeeded",
+                        "parameters": {"num_instances": 100, "num_nodes_per_instance": 64, "ratio_nodes_in_cycles": 0.40, "seed": 0}
+                    }
+                }
+            },
+            "oracle": {
+                "class": "src.oracle.custom.oracle_tree_cycles.TreeCyclesOracle",
+                "parameters": {}
+            },
             "compose_dataset_info": "./lab/config/snippets/dataset_infos/tcr-ablation-cycles.json",
             "explainer": {
                 "class": "src.explainer.future.meta.generate_minimize.GenerateMinimize",
