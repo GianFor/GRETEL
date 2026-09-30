@@ -221,6 +221,30 @@ Omit `--probe` to run all configured probes. `--limit` limits saved original
 instances; each instance can contain several counterfactuals. Different
 judges can evaluate the same dumps without regenerating explanations.
 
+## Mini pilot with 10-node TreeCycles
+
+The mini configs use 10 seeded graphs with exactly 10 nodes, two stratified
+splits without shuffling and fold 0: five held-out instances (two trees and
+three cyclic graphs). DCE + LocalSearch and all six generation stages run
+normally. The generator is Qwen3-8B; one gpt-oss-20b judge evaluates all three
+probes, including both Recourse arms. Models run in separate Slurm jobs.
+The dedicated scope is `paper-probes-mini-10nodes`.
+
+From the cluster checkout, after updating `llm-probes`:
+
+```bash
+mkdir -p lab/output/logs
+mini_gen_job=$(sbatch --parsable --job-name=probes-mini-gen --time=02:00:00 --export=ALL,MAX_WAIT=1800 scripts/slurm_paper_probes.sh generate lab/config/probes/paper_treecycles_10nodes_generate.jsonc)
+sbatch --job-name=probes-mini-judge --time=02:00:00 --export=ALL,MAX_WAIT=1800 --dependency="afterok:${mini_gen_job%%;*}" scripts/slurm_paper_probes.sh probe lab/config/probes/paper_treecycles_10nodes_judge.jsonc lab/output/results/paper-probes-mini-10nodes
+```
+
+The judge job starts only after successful completion of generation. Review
+both Slurm logs and the probe `summary.json` under the mini scope: Slurm
+completion alone does not imply successful parsing or successful proposals.
+The waiting policy requires 30000 MiB free on the assigned GPU, with a
+30-minute wait cap for this mini run. This config has been checked locally;
+running real models and reviewing their outputs is the cluster test.
+
 ## Local technical feedback
 
 ```bash
