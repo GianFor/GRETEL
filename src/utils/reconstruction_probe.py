@@ -13,6 +13,7 @@ import json
 import re
 
 from src.utils.reconstruction_metrics import parse_extraction, score_delta
+from src.utils.probe_common import call_many, select_text
 
 JUDGE_SYSTEM_PROMPT = """You are a Graph Modification Extractor.
 Your task is to read a text about a graph counterfactual and list, as structured data, the TECHNICAL MODIFICATIONS it mentions: which edges were added, which edges were removed, and which node features were changed.
@@ -23,11 +24,14 @@ RULES:
 - Use the exact node identifiers and feature names that appear in the text.
 - Return ONLY a JSON object, no Markdown, no comments, with exactly this schema:
 {
+  "nodes_added": [id, ...],
+  "nodes_removed": [id, ...],
   "edges_added": [[u, v], ...],
   "edges_removed": [[u, v], ...],
-  "features_changed": [{"node": id, "feature": "name"}, ...]
+  "features_changed": [{"node": id, "feature": "name", "from": value, "to": value}, ...]
 }
 - Use empty lists for modification types the text does not mention.
+- Include numeric from/to values when explicitly given by the text. Never invent them.
 """
 
 _JSON_BLOCK = re.compile(r'```(?:json)?\s*(\{.*?\})\s*```', re.DOTALL)
@@ -57,53 +61,60 @@ def build_prompt(narrative, graph_text, use_context):
     return prompt
 
 
-def prepare(output, graph_text, use_context, mode):
+def prepare(output, graph_text, use_context, mode, require_structured=False, directed=False):
     """Pick the narrative for the condition and build the judge prompt.
 
     Returns (record, prompt); prompt is None when there is nothing to judge,
     in which case the record is already final (status "unparsed")."""
-    narrative = output if mode == 'full' else narrative_field(output)
     record = {'status': None, 'narrative_used': None, 'judge_output': None,
               'extraction': None, 'scores': None}
-    if not narrative or not narrative.strip():
+    try:
+        narrative = select_text(output, mode, require_structured, directed)
+    except ValueError as exc:
         record['status'] = 'unparsed'
+        record['error'] = str(exc)
         return record, None
     record['narrative_used'] = narrative
     return record, build_prompt(narrative, graph_text, use_context)
 
 
-def finish(record, judge_output, truth, directed):
+def finish(record, judge_output, truth, directed, strict=False, feature_match='identity'):
     """Parse the judge's answer and score it against the ground truth."""
     record['judge_output'] = judge_output
-    extraction = parse_extraction(judge_output)
+    extraction = parse_extraction(judge_output, strict, directed, feature_match)
     if extraction is None:
         record['status'] = 'judge_unparsed'
         return record
     record['status'] = 'success'
     record['extraction'] = extraction
-    record['scores'] = score_delta(truth, extraction, directed)
+    if truth is not None:
+        record['scores'] = score_delta(truth, extraction, directed, feature_match)
     return record
 
 
-def run(judge, items, use_context, mode):
+def run(judge, items, use_context, mode, strict=False, feature_match='identity', require_structured=False):
     """Run the probe over items = [(output, graph_text, truth, directed), ...].
 
     Prompts are sent together through judge.explain_many when the backend
     offers it (batched under vllm), one by one otherwise."""
     records, prompts, pending = [], [], []
     for output, graph_text, truth, directed in items:
-        record, prompt = prepare(output, graph_text, use_context, mode)
+        record, prompt = prepare(output, graph_text, use_context, mode, require_structured, directed)
         records.append(record)
         if prompt is not None:
-            prompts.append((JUDGE_SYSTEM_PROMPT, prompt))
+            system = JUDGE_SYSTEM_PROMPT
+            if feature_match == 'transition':
+                system += '\nThis condition requires numeric from/to values for every reported feature transition.\n'
+            prompts.append((system, prompt))
             pending.append(len(records) - 1)
 
     if prompts:
-        if hasattr(judge, 'explain_many'):
-            answers = judge.explain_many(prompts)
-        else:
-            answers = [judge.explain_counterfactual(system=s, prompt=p) for s, p in prompts]
+        answers = call_many(judge, prompts)
         for index, answer in zip(pending, answers):
             _, _, truth, directed = items[index]
-            finish(records[index], answer, truth, directed)
+            records[index]['judge_request'] = answer['judge_request']
+            if answer['status'] != 'success':
+                records[index].update(answer)
+            else:
+                finish(records[index], answer['judge_output'], truth, directed, strict, feature_match)
     return records

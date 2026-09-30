@@ -1,0 +1,499 @@
+#!/usr/bin/env python3
+"""General contracts and a two-pass integration test with real TreeCyclesOracle.
+
+LLM answers and the minimal CF explainer are explicitly scripted. --light
+replaces only the torch-importing utils package initializer and Dataset's
+annotation import; all exercised graph, oracle, factory and stage code is real.
+Use --demo-output DIR to retain five sample dumps and the offline results.
+"""
+import argparse
+import copy
+import json
+from pathlib import Path
+import sys
+import tempfile
+import types
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / 'tests'))
+parser = argparse.ArgumentParser(add_help=False)
+parser.add_argument('--light', action='store_true')
+parser.add_argument('--demo-output')
+OPTIONS, remaining = parser.parse_known_args()
+sys.argv = [sys.argv[0]] + remaining
+if OPTIONS.light:
+    import src
+    package = types.ModuleType('src.utils')
+    package.__path__ = [str(ROOT / 'src' / 'utils')]
+    sys.modules['src.utils'] = package
+    src.utils = package
+    import src.dataset
+    annotation = types.ModuleType('src.dataset.dataset_base')
+    annotation.Dataset = type('Dataset', (), {})
+    sys.modules[annotation.__name__] = annotation
+    src.dataset.dataset_base = annotation
+
+import numpy as np
+from probes_fixtures import DatasetFixture, OneEditFixture, ScriptedLLM, answer, delta, llm
+from src.core.factory_base import get_instance_kvargs
+from src.dataset.instances.graph import GraphInstance
+from src.evaluation.future.stages.main_pipeline import MainPipeline
+from src.future.explanation.local.graph_counterfactual import LocalGraphCounterfactualExplanation
+from src.oracle.oracle_factory import OracleFactory
+from src.utils.context import Context
+from src.utils.logger import GLogger
+from src.utils.probe_common import call_many, inverse_delta, read_object, select_text, validate_delta
+from src.utils.probe_graph import apply_edits, restore, snapshot
+from src.utils.probe_inputs import NARRATIVES_STAGE, run_saved, summarize
+from src.utils import reconstruction_probe, reversal_probe, recourse_probe
+
+
+class Replies:
+    def __init__(self, *answers):
+        self.answers = iter(answers)
+        self.prompts = []
+
+    def explain_counterfactual(self, system, prompt):
+        self.prompts.append((system, prompt))
+        return next(self.answers)
+
+
+def context_at(root):
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    config = {'experiment': {'scope': 'scripted-integration'}, 'store_paths': [
+        {'name': name + '_store_path', 'address': str(root / name)}
+        for name in ('dataset', 'oracle', 'explainer', 'output', 'log', 'working', 'embedder')]}
+    path = root / 'test-context.json'
+    path.write_text(json.dumps(config))
+    Context._Context__global = None
+    context = Context.get_context(str(path))
+    context.run_number = 1
+    GLogger._path = str(root / 'log')
+    return context
+
+
+def integrated_run(root, samples=5):
+    context = context_at(root)
+    dataset = DatasetFixture(context, {'class': 'probes_fixtures.DatasetFixture', 'parameters': {}})
+    oracle = OracleFactory(context).get_oracle({'class': 'src.oracle.custom.oracle_tree_cycles.TreeCyclesOracle', 'parameters': {}}, dataset)
+    explainer = OneEditFixture(context, {'class': 'probes_fixtures.OneEditFixture', 'parameters': {'fold_id': 0}, 'dataset': dataset, 'oracle': oracle})
+    config = {'class': 'src.evaluation.future.stages.main_pipeline.MainPipeline', 'parameters': {'stages': [
+        {'class': 'src.evaluation.future.stages.runtime.Runtime', 'parameters': {}},
+        {'class': NARRATIVES_STAGE, 'parameters': {'generator': llm('generator'), 'generator_family': 'scripted-generator'}},
+        {'class': 'src.evaluation.future.stages.probe_dump.ProbeDump', 'parameters': {}}]}}
+    pipeline = MainPipeline(context, config)
+    explanations = []
+    for instance in [i for i in dataset.instances if i.label == 0][:samples]:
+        explanation = LocalGraphCounterfactualExplanation(context, dataset, oracle, explainer, instance, [])
+        explanations.append(pipeline.process(explanation))
+    judge = ScriptedLLM(context, llm('judge'))
+    options = {'judge': llm('judge'), 'judge_family': 'scripted-judge', 'probes': {name: {} for name in ('reconstruction', 'reversal', 'recourse')}}
+    from scripts.run_paper_probes import execute, load_dumps
+    dumps = load_dumps(Path(root) / 'output')
+    output, errors = execute(judge, dumps, options, context, list(options['probes']), Path(root) / 'results')
+    return context, explanations, dumps, output, errors
+
+
+class GeneralContracts(unittest.TestCase):
+    def test_invalid_edits_cannot_become_empty_predictions(self):
+        for value in ({}, {'foo': []}, {'edges_added': [[True, 1]], 'edges_removed': [], 'features_changed': []},
+                      delta(added=[[-1, 2]]), delta(added=[[1.2, 2]]), delta(added=[[1, 2], [2, 1]]),
+                      delta(added=[[1, 2]], removed=[[2, 1]]), delta(features=[{'node': 0, 'feature': 'x'}])):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate_delta(value, feature_match='transition')
+        self.assertFalse(any(validate_delta(delta()).values()))
+
+    def test_duplicate_json_fields_are_rejected(self):
+        with self.assertRaises(ValueError):
+            read_object('{"edges_added": [], "edges_added": [[0,1]]}')
+        with self.assertRaises(ValueError):
+            read_object("{'edits': {}, 'edits': {'edges_added': []}}", allow_literal=True)
+
+    def test_full_preserves_generator_answer_and_dict_has_no_truth(self):
+        raw = 'Preface\n```json\n' + answer(delta(added=[[0, 2]])) + '\n```'
+        self.assertEqual(select_text(raw, 'full', True), raw)
+        self.assertTrue(select_text(raw, 'dict', True).startswith('TEST EDITS:'))
+        malformed = json.dumps({'Natural_Language_Explanation': 'Valid-looking text'})
+        with self.assertRaises(ValueError):
+            select_text(malformed, 'dict', True)
+
+    def test_batch_cardinality_errors_keep_every_attempt(self):
+        model = types.SimpleNamespace(explain_many=lambda prompts: ['only one'])
+        records = call_many(model, [('a', 'b'), ('a', 'c')])
+        self.assertEqual(len(records), 2)
+        self.assertEqual([r['status'] for r in records], ['model_error'] * 2)
+
+    def test_directed_edges_and_feature_transitions_are_measured(self):
+        truth = delta(added=[[0, 1]], features=[{'node': 0, 'feature': 'x', 'from': 0, 'to': 1}])
+        predicted = delta(added=[[1, 0]], features=[{'node': 0, 'feature': 'x', 'from': 1, 'to': 0}])
+        r = reconstruction_probe.run(Replies(json.dumps(predicted)), [(answer(truth), '', truth, True)],
+                                     False, 'dict', True, 'transition', True)[0]
+        self.assertEqual(r['status'], 'success')
+        self.assertEqual(r['scores']['edges']['f1'], 0)
+        self.assertEqual(r['scores']['features_changed']['f1'], 0)
+
+    def test_reversal_independent_of_truth_and_semantic_parse(self):
+        forward = delta(added=[[7, 9]])
+        backward = inverse_delta(forward)
+        judge = Replies(json.dumps(forward), json.dumps(backward), 'YES because...')
+        r = reversal_probe.run(judge, [(answer(forward), answer(backward), '', '', False)],
+                               mode='dict', feature_match='transition', require_structured=True)[0]
+        self.assertEqual(r['structural_scores']['edges']['f1'], 1)
+        self.assertEqual(r['status'], 'partial_error')
+        self.assertEqual(r['semantic']['status'], 'judge_unparsed')
+        self.assertEqual(len(judge.prompts), 3)
+
+    def test_snapshot_and_removal_preserve_all_attributes(self):
+        a = np.array([[0, 2, 0], [2, 0, 3], [0, 3, 0]], dtype=float)
+        g = GraphInstance(3, 1, a, node_features=np.array([[.1], [.2], [.3]]),
+                          edge_features=np.array([[4], [5], [6], [7]]), edge_weights=np.array([2, 2, 3, 3]),
+                          graph_features=np.array([11, 12]))
+        clone = restore(json.loads(json.dumps(snapshot(g))))
+        for field in ('data', 'node_features', 'edge_features', 'edge_weights', 'graph_features'):
+            np.testing.assert_array_equal(getattr(clone, field), getattr(g, field))
+        changed = apply_edits(clone, delta(removed=[[0, 1]]))
+        np.testing.assert_array_equal(changed.edge_weights, [3, 3])
+        np.testing.assert_array_equal(changed.edge_features, [[6], [7]])
+        np.testing.assert_array_equal(changed.graph_features, [11, 12])
+        with self.assertRaises(NotImplementedError):
+            apply_edits(g, delta(added=[[0, 2]]))
+        added = apply_edits(g, delta(added=[[0, 2]]), edge_defaults={'weight': 4, 'features': [8]})
+        self.assertEqual(len(added.edge_features), 6)
+        np.testing.assert_array_equal(g.data, a)
+
+    def test_feature_from_and_node_additions_cannot_be_guessed(self):
+        g = GraphInstance(1, 0, np.zeros((2, 2)))
+        with self.assertRaises(ValueError):
+            apply_edits(g, delta(features=[{'node': 0, 'feature': 'x', 'from': 1, 'to': 2}]), {'x': 0})
+        value = delta()
+        value['nodes_added'] = [2]
+        with self.assertRaises(NotImplementedError):
+            apply_edits(g, value)
+        candidate = apply_edits(g, delta(features=[{'node': 0, 'feature': 'x', 'from': 0, 'to': 2}]), {'x': 0})
+        self.assertEqual(candidate.node_features[0, 0], 2)
+
+    def test_float32_feature_values_and_unrepresentable_changes(self):
+        g = GraphInstance(1, 0, np.zeros((2, 2)), node_features=np.array([[.1], [0]]))
+        candidate = apply_edits(g, delta(features=[{'node': 0, 'feature': 0, 'from': .1, 'to': .2}]))
+        self.assertEqual(candidate.node_features[0, 0], np.float32(.2))
+        with self.assertRaises(ValueError):
+            apply_edits(g, delta(features=[{'node': 0, 'feature': 0, 'from': .1, 'to': .1000000001}]))
+
+    def test_self_loops_are_visible_in_the_true_delta(self):
+        from src.utils.typed_delta import typed_delta_from_instances
+        g = GraphInstance(1, 0, np.zeros((2, 2)))
+        candidate = apply_edits(g, delta(added=[[0, 0]]))
+        self.assertEqual(typed_delta_from_instances(g, candidate)['edges_added'], [[0, 0]])
+
+    def test_snapshot_preserves_empty_attribute_dimensions(self):
+        g = GraphInstance(1, 0, np.zeros((2, 2)), node_features=np.empty((2, 0)), edge_features=np.empty((0, 0)))
+        restored = restore(json.loads(json.dumps(snapshot(g))))
+        self.assertEqual(restored.node_features.shape, (2, 0))
+        self.assertEqual(restored.edge_features.shape, (0, 0))
+        candidate = apply_edits(restored, delta(added=[[0, 1]]))
+        self.assertEqual(candidate.edge_features.shape, (2, 0))
+
+    def test_directed_recourse_changes_only_one_orientation(self):
+        g = GraphInstance(1, 0, np.array([[0, 1], [0, 0]]), directed=True)
+        candidate = apply_edits(g, delta(added=[[1, 0]]))
+        removed = apply_edits(candidate, delta(removed=[[0, 1]]))
+        np.testing.assert_array_equal(removed.data, [[0, 0], [1, 0]])
+
+    def test_recourse_rejects_proposal_restored_by_preprocessing(self):
+        g = GraphInstance(1, 0, np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]]))
+        truth = delta(added=[[0, 2]])
+        item = dict(instance=g, output=answer(truth), truth=truth, input_label=0, target_label=1,
+                    graph_text='graph', modifications_text='edits', domain='domain', feature_map={})
+        def preprocess(candidate):
+            candidate.data[0, 1] = candidate.data[1, 0] = 1
+            candidate.edge_features = g.edge_features.copy()
+            candidate.edge_weights = g.edge_weights.copy()
+        r = recourse_probe.run(Replies(json.dumps(delta(removed=[[0, 1]]))), [item], lambda graph: 0,
+                               mode='dict', control=False, require_structured=True, preprocess=preprocess)[0]
+        self.assertEqual(r['with_explanation']['status'], 'invalid_proposal')
+
+    def test_backend_final_channel_does_not_mix_in_analysis(self):
+        from src.LLMexplaneability.huggingface import HuggingFaceLLM
+        text = '<|channel|>analysis<|message|>{"wrong":1}<|end|><|start|>assistant<|channel|>final<|message|>{"right":2}<|return|>'
+        self.assertEqual(HuggingFaceLLM._clean(text), '{"right":2}')
+        self.assertEqual(HuggingFaceLLM._clean('<|channel|>analysis<|message|>{"wrong":1}'), '')
+        self.assertEqual(HuggingFaceLLM._clean('<think>unfinished'), '')
+        self.assertEqual(HuggingFaceLLM._clean('<think>reasoning</think>YES'), 'YES')
+
+    def test_recourse_control_differs_only_by_explanation(self):
+        a = recourse_probe.build_prompt('graph', 'edits', 'domain', 'narrative', 1)
+        b = recourse_probe.build_prompt('graph', 'edits', 'domain', None, 1)
+        self.assertEqual(a[1].replace('EXPLANATION:\nnarrative\n', ''), b[1])
+        self.assertNotIn('Explanation', b[0])
+        self.assertNotIn('empty set', a[0])
+
+    def test_recourse_empty_repeat_bad_index_and_oracle_errors(self):
+        g = GraphInstance(1, 0, np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]]))
+        truth = delta(added=[[0, 2]])
+        item = dict(instance=g, output=answer(truth), truth=truth, input_label=0, target_label=1,
+                    graph_text='graph', modifications_text='edits', domain='domain', feature_map={})
+        for edit in (delta(), truth, delta(added=[[0, 20]])):
+            r = recourse_probe.run(Replies(json.dumps(edit)), [item], lambda graph: 0, mode='dict', control=False, require_structured=True)[0]
+            self.assertEqual(r['with_explanation']['status'], 'invalid_proposal')
+        r = recourse_probe.run(Replies(json.dumps(delta(removed=[[0, 1]]))), [item], lambda graph: 0,
+                               mode='dict', control=False, require_structured=True)[0]
+        self.assertEqual(r['status'], 'success')
+        self.assertFalse(r['with_explanation']['successful'])
+        self.assertIn('candidate', r['with_explanation'])
+        bad = dict(item, input_label=1)
+        r = recourse_probe.run(Replies(), [bad], lambda graph: 0, control=False)[0]
+        self.assertEqual(r['status'], 'oracle_error')
+
+    def test_recourse_rejects_partial_reuse_in_both_arms(self):
+        g = GraphInstance(1, 0, np.zeros((4, 4)))
+        truth = delta(added=[[0, 1], [0, 2]])
+        item = dict(instance=g, output=answer(truth), truth=truth, input_label=0, target_label=1,
+                    graph_text='graph', modifications_text='edits', domain='domain', feature_map={})
+        for proposal in (delta(added=[[1, 0]]), delta(added=[[0, 1], [0, 3]])):
+            calls = []
+            def predictor(graph):
+                calls.append(graph)
+                return 0
+            r = recourse_probe.run(Replies(json.dumps(proposal), json.dumps(proposal)), [item], predictor,
+                                   mode='dict', require_structured=True)[0]
+            for arm in ('with_explanation', 'without_explanation'):
+                self.assertEqual(r[arm]['status'], 'invalid_proposal')
+                self.assertEqual(r[arm]['reused_edits'], {'edges_added': [[0, 1]]})
+                self.assertEqual(r[arm]['reuse_phase'], 'proposal')
+            self.assertEqual(len(calls), 1)  # Factual replay only, no invalid-candidate predictions.
+
+    def test_recourse_reuse_respects_orientation_and_feature_aliases(self):
+        g = GraphInstance(1, 0, np.array([[0, 1], [0, 0]]), directed=True)
+        truth = delta(removed=[[0, 1]], features=[{'node': 0, 'feature': 'x', 'from': 0.0, 'to': 1.0}])
+        item = dict(instance=g, output=answer(truth), truth=truth, input_label=0, target_label=1,
+                    graph_text='graph', modifications_text='edits', domain='domain', feature_map={'x': 0})
+        proposal = delta(features=[{'node': 0, 'feature': 0, 'from': 0, 'to': 1}])
+        r = recourse_probe.run(Replies(json.dumps(proposal)), [item], lambda graph: 0,
+                               mode='dict', control=False, require_structured=True)[0]
+        self.assertEqual(r['with_explanation']['status'], 'invalid_proposal')
+        self.assertIn('features_changed', r['with_explanation']['reused_edits'])
+        # Another transition on that column, and the opposite directed edge, are new edits.
+        proposal = delta(added=[[1, 0]], features=[{'node': 0, 'feature': 0, 'from': 0, 'to': 2}])
+        r = recourse_probe.run(Replies(json.dumps(proposal)), [item], lambda graph: int(graph.data[1, 0] != 0),
+                               mode='dict', control=False, require_structured=True)[0]
+        self.assertTrue(r['with_explanation']['successful'])
+
+    def test_recourse_rejects_reuse_created_by_preprocessing(self):
+        g = GraphInstance(1, 0, np.zeros((4, 4)))
+        truth = delta(added=[[0, 1]])
+        item = dict(instance=g, output=answer(truth), truth=truth, input_label=0, target_label=1,
+                    graph_text='graph', modifications_text='edits', domain='domain', feature_map={})
+        def preprocess(candidate):
+            changed = apply_edits(candidate, truth)
+            candidate.data = changed.data
+            candidate.edge_features = changed.edge_features
+            candidate.edge_weights = changed.edge_weights
+        r = recourse_probe.run(Replies(json.dumps(delta(added=[[0, 2]]))), [item], lambda graph: 0,
+                               mode='dict', control=False, require_structured=True, preprocess=preprocess)[0]
+        arm = r['with_explanation']
+        self.assertEqual(arm['status'], 'invalid_proposal')
+        self.assertEqual(arm['reuse_phase'], 'realized')
+        self.assertEqual(arm['reused_edits'], {'edges_added': [[0, 1]]})
+        self.assertEqual(arm['realized_edits']['edges_added'], [[0, 1], [0, 2]])
+        self.assertIn('candidate', arm)
+
+    def test_summary_exposes_errors_and_both_denominators(self):
+        rows = [{'status': 'success', 'with_explanation': {'status': 'success', 'successful': True}},
+                {'status': 'input_error'}, {'status': 'partial_error', 'with_explanation': {'status': 'judge_unparsed'}}]
+        s = summarize('recourse', rows)
+        self.assertEqual(s['n'], 3)
+        self.assertEqual(s['with_explanation_success_rate_all_attempts'], 1 / 3)
+        self.assertEqual(s['with_explanation_success_rate_valid'], 1)
+
+    def test_model_error_remains_distinct_from_wrong_extraction(self):
+        truth = delta(added=[[0, 2]])
+        records = reconstruction_probe.run(Replies(None, '{}', json.dumps(delta())),
+                                           [(answer(truth), '', truth, False)] * 3,
+                                           False, 'dict', True, 'transition', True)
+        self.assertEqual([r['status'] for r in records], ['model_error', 'judge_unparsed', 'success'])
+        self.assertEqual(records[2]['scores']['edges']['f1'], 0)
+
+    def test_saved_generation_states_keep_skipped_and_batch_failures(self):
+        g = GraphInstance(1, 0, np.zeros((2, 2)))
+        truth = delta(added=[[0, 1]])
+        item = {'status': 'partial_error', 'input_status': 'success', 'input': snapshot(g),
+                'truth': truth, 'direct_output': None, 'inverse_output': None}
+        failure = call_many(types.SimpleNamespace(explain_many=lambda prompts: []), [('s', 'direct'), ('s', 'inverse')])
+        item.update(direct_generation=failure[0], inverse_generation=failure[1])
+        saved = {'schema_version': 1, 'node_matching': 'position', 'counterfactuals': [item]}
+        judge = Replies()
+        r = run_saved('reversal', judge, saved)[0]
+        self.assertEqual(r['status'], 'model_error')
+        self.assertEqual(r['generation_failed_directions'], ['direct', 'inverse'])
+        self.assertFalse(judge.prompts)
+        skipped = {'status': 'not_counterfactual', 'error': 'No flip'}
+        saved['counterfactuals'] = [skipped]
+        r = run_saved('reconstruction', judge, saved)[0]
+        self.assertEqual(r['status'], 'input_error')
+        self.assertEqual(r['input_status'], 'not_counterfactual')
+        for outcome in r['generation_outcomes'].values():
+            self.assertEqual(outcome['status'], 'not_attempted')
+
+    def test_invalid_runner_conditions_fail_before_inference(self):
+        from scripts.run_paper_probes import validate_configuration
+        for options in ({'conditions': [{'context': 'on'}]}, {'control': 'false'},
+                        {'conditions': [{}, {}]}, {'conditions': []}):
+            with self.assertRaises(ValueError):
+                validate_configuration({'probes': {'recourse': options}}, ['recourse'])
+
+    def test_corrupted_saved_file_is_retained_as_an_error(self):
+        from scripts.run_paper_probes import load_dumps
+        with tempfile.TemporaryDirectory() as root:
+            folder = Path(root) / 'probe_inputs'
+            folder.mkdir()
+            (folder / 'cf_bad.json').write_text('{broken')
+            dumps = load_dumps(root)
+            self.assertEqual(len(dumps), 1)
+            self.assertIn('input_error', dumps[0][1])
+
+
+class TwoPassIntegration(unittest.TestCase):
+    def test_generation_states_survive_dump_and_do_not_block_unrelated_probes(self):
+        with tempfile.TemporaryDirectory(prefix='gretel-generation-states-') as root:
+            context, explanations, _, _, _ = integrated_run(root, samples=1)
+            exp = explanations[0]
+            original = copy.deepcopy(exp.stages_info[NARRATIVES_STAGE])
+            direct = original['counterfactuals'][0]['direct_output']
+            inverse = original['counterfactuals'][0]['inverse_output']
+            stage = get_instance_kvargs(NARRATIVES_STAGE, {'context': context,
+                'local_config': {'parameters': {'generator': llm('generator')}}})
+            dump = get_instance_kvargs('src.evaluation.future.stages.probe_dump.ProbeDump',
+                                       {'context': context, 'local_config': {'parameters': {}}})
+            from scripts.run_paper_probes import execute, load_dumps
+            for direction, replies in (('inverse', Replies(direct)), ('direct', Replies(None, inverse))):
+                replies.local_config = llm('generator')
+                stage.generator = replies
+                stage.process(exp)
+                dump.process(exp)
+                dumps = load_dumps(Path(root) / 'output')
+                saved = dumps[0][1]['data']
+                item = saved['counterfactuals'][0]
+                self.assertEqual(item['input_status'], 'success')
+                self.assertEqual(item['status'], 'partial_error')
+                self.assertEqual(item[direction + '_generation']['status'], 'model_error')
+                self.assertIn('error', item[direction + '_generation'])
+                options = {'judge': llm('judge'), 'probes': {n: {} for n in ('reconstruction', 'reversal', 'recourse')}}
+                output, errors = execute(ScriptedLLM(context, llm('judge')), dumps, options, context,
+                                         list(options['probes']), Path(root) / 'results')
+                self.assertTrue(errors)
+                self.assertEqual(json.loads((output / 'manifest.json').read_text())['protocol_version'], 2)
+                for name in options['probes']:
+                    path = next((output / name / 'ctx-off_mode-dict').glob('*.json'))
+                    result = json.loads(path.read_text())['counterfactuals'][0]
+                    expected = 'success' if direction == 'inverse' and name != 'reversal' else 'model_error'
+                    self.assertEqual(result['status'], expected)
+                    self.assertEqual(result['generation_outcomes'][direction]['status'], 'model_error')
+                    if expected == 'model_error':
+                        self.assertEqual(result['error_origin'], 'generator')
+                summary = json.loads((output / 'summary.json').read_text())
+                self.assertEqual(summary[1]['generation_status_counts'][direction], {'model_error': 1})
+
+    def test_malformed_generation_is_distinct_from_backend_error_and_legacy_is_readable(self):
+        with tempfile.TemporaryDirectory(prefix='gretel-malformed-generation-') as root:
+            context, explanations, _, _, _ = integrated_run(root, samples=1)
+            exp = explanations[0]
+            inverse = exp.stages_info[NARRATIVES_STAGE]['counterfactuals'][0]['inverse_output']
+            stage = get_instance_kvargs(NARRATIVES_STAGE, {'context': context,
+                'local_config': {'parameters': {'generator': llm('generator')}}})
+            model = Replies('{}', inverse)
+            model.local_config = llm('generator')
+            stage.generator = model
+            stage.process(exp)
+            saved = exp.stages_info[NARRATIVES_STAGE]
+            generation = saved['counterfactuals'][0]['direct_generation']
+            self.assertEqual(generation['call_status'], 'success')
+            self.assertEqual(generation['status'], 'unparsed')
+            judge = Replies()
+            record = run_saved('reconstruction', judge, saved)[0]
+            self.assertEqual(record['status'], 'unparsed')
+            self.assertEqual(record['error_origin'], 'generator')
+            self.assertFalse(judge.prompts)
+            # Old schema-1 records have no input_status; backend errors still propagate.
+            old = copy.deepcopy(saved)
+            item = old['counterfactuals'][0]
+            item.pop('input_status')
+            item['status'] = 'success'
+            item['direct_generation'] = {'status': 'model_error', 'error': 'backend failure'}
+            item['direct_output'] = None
+            record = run_saved('reversal', Replies(), old)[0]
+            self.assertEqual(record['status'], 'model_error')
+            self.assertEqual(record['generation_failed_directions'], ['direct'])
+            # Older valid text without direction metadata can still be evaluated.
+            item['direct_output'] = answer(delta(added=[[0, 1]]))
+            item.pop('direct_generation')
+            extracted = {k: v for k, v in item['truth'].items() if k != 'size'}
+            record = run_saved('reconstruction', Replies(json.dumps(extracted)), old)[0]
+            self.assertEqual(record['status'], 'success')
+            self.assertEqual(record['generation_outcomes']['direct']['status'], 'success')
+
+    def test_five_treecycles_graphs_all_probes_and_offline_stage_parity(self):
+        with tempfile.TemporaryDirectory(prefix='gretel-paper-probes-') as root:
+            generator_inits = ScriptedLLM.init_counts['generator']
+            context, explanations, dumps, output, errors = integrated_run(root)
+            self.assertEqual(ScriptedLLM.init_counts['generator'] - generator_inits, 1)
+            self.assertFalse(errors)
+            self.assertEqual(len(dumps), 5)
+            summary = json.loads((output / 'summary.json').read_text())
+            self.assertEqual([r['n'] for r in summary], [5, 5, 5])
+            self.assertEqual(summary[0]['edges_f1_valid_mean'], 1)
+            self.assertEqual(summary[1]['edges_f1_valid_mean'], 1)
+            self.assertEqual(summary[1]['semantic_yes_count'], 5)
+            self.assertEqual(summary[2]['with_explanation_n_successful'], 5)
+            self.assertEqual(summary[2]['without_explanation_n_successful'], 0)
+            for name in ('reconstruction', 'reversal', 'recourse'):
+                stage = get_instance_kvargs('src.evaluation.future.stages.' + name + '.' + name.capitalize(),
+                    {'context': context, 'local_config': {'parameters': {'judge': llm('judge'),
+                     'narratives_stage': NARRATIVES_STAGE, 'feature_match': 'transition', 'mode': 'dict'}}})
+                before = explanations[0].oracle.get_calls_count()
+                stage.process(explanations[0])
+                self.assertEqual(before, explanations[0].oracle.get_calls_count())
+                actual = explanations[0].stages_info[context.get_fullname(stage)]['counterfactuals']
+                expected = run_saved(name, ScriptedLLM(context, llm('judge')), explanations[0].stages_info[NARRATIVES_STAGE],
+                                     predictor=explanations[0].oracle.predict, dataset=explanations[0].dataset,
+                                     preprocess=explanations[0].dataset.manipulate)
+                self.assertEqual(actual, expected)
+            # Reusing sample IDs in another fold must preserve the first files.
+            explanations[0].explainer.fold_id = 1
+            pipeline_dump = get_instance_kvargs('src.evaluation.future.stages.probe_dump.ProbeDump',
+                                                {'context': context, 'local_config': {'parameters': {}}})
+            pipeline_dump.process(explanations[0])
+            from scripts.run_paper_probes import load_dumps
+            self.assertEqual(len(load_dumps(Path(root) / 'output')), 6)
+            self.assertEqual(len(load_dumps(Path(root) / 'output', 2)), 2)
+            saved = copy.deepcopy(explanations[0].stages_info[NARRATIVES_STAGE])
+            without_truth = copy.deepcopy(saved)
+            without_truth['counterfactuals'][0].pop('truth')
+            independent = run_saved('reversal', ScriptedLLM(context, llm('judge')), without_truth)
+            self.assertEqual(independent[0]['status'], 'success')
+            saved['counterfactuals'].append({'status': 'not_counterfactual'})
+            records = run_saved('reconstruction', ScriptedLLM(context, llm('judge')), saved)
+            self.assertEqual(len(records), 2)
+            self.assertEqual(records[1]['status'], 'input_error')
+            saved['generator'] = llm('judge')
+            with self.assertRaises(ValueError):
+                run_saved('reversal', ScriptedLLM(context, llm('judge')), saved)
+
+
+if __name__ == '__main__':
+    result = unittest.main(exit=False)
+    if result.result.wasSuccessful() and OPTIONS.demo_output:
+        _, _, _, output, errors = integrated_run(OPTIONS.demo_output)
+        Path(OPTIONS.demo_output, 'README.md').write_text(
+            '# Feedback tecnico su cinque grafi TreeCycles\n\n'
+            'Dataset: generazione TreeCyclesSeeded (50 grafi, 16 nodi, seed 0); cinque grafi senza cicli. '
+            'Oracolo reale: TreeCyclesOracle di GRETEL. Counterfactual minimo: aggiunta di un solo arco.\n\n'
+            'Generatore e giudice sono SCRIPTED: questi punteggi verificano il software, '
+            'non sono risultati sperimentali o evidenza per il paper. La narrazione sintetica '
+            'codifica gli edit; Recourse con narrazione aggiunge un arco diverso, il controllo rimuove un arco.\n\n'
+            f'Risultati salvati: `{output}`. Dump completi sotto `output/`; grafi delle proposte nei risultati Recourse.\n'
+            f'Modalità di test locale: {"light (sole importazioni delle annotazioni Dataset e initializer utils isolate)" if OPTIONS.light else "ambiente completo"}.\n')
+        print('Scripted integration artifacts:', output)
+    sys.exit(0 if result.result.wasSuccessful() else 1)

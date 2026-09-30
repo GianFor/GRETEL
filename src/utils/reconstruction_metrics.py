@@ -10,8 +10,8 @@ Conventions (frozen, they match the thesis protocol):
 
 Edits are matched strictly:
 - edges as canonical pairs (min, max) for undirected graphs
-- feature changes as (node, feature) pairs; the values are not compared,
-  a narrative rarely carries them exactly
+- feature_match=identity: (node, feature), the thesis's legacy convention
+- feature_match=transition: (node, feature, from, to), exact numeric values
 """
 import json
 import re
@@ -38,23 +38,28 @@ def edge_key(edge, directed=False):
     return (u, v) if directed else (min(u, v), max(u, v))
 
 
-def feature_key(change):
-    return (int(change['node']), str(change['feature']))
+def feature_key(change, feature_match='identity'):
+    key = (int(change['node']), str(change['feature']))
+    return key + (change['from'], change['to']) if feature_match == 'transition' else key
 
 
-def delta_to_sets(delta, directed=False):
+def delta_to_sets(delta, directed=False, feature_match='identity'):
     """Turn a typed delta (ground truth or extraction) into one set per type."""
     sets = {}
     for edit_type in ('edges_added', 'edges_removed'):
         sets[edit_type] = {edge_key(e, directed) for e in delta.get(edit_type) or []}
-    sets['features_changed'] = {feature_key(c) for c in delta.get('features_changed') or []}
+    sets['features_changed'] = {feature_key(c, feature_match) for c in delta.get('features_changed') or []}
+    for key in ('nodes_added', 'nodes_removed'):
+        sets[key] = set(delta.get(key) or [])
     return sets
 
 
-def score_delta(truth, prediction, directed=False):
+def score_delta(truth, prediction, directed=False, feature_match='identity'):
     """Per-type metrics plus a structural aggregate over both edge types."""
-    truth_sets = delta_to_sets(truth, directed)
-    pred_sets = delta_to_sets(prediction, directed)
+    if feature_match not in ('identity', 'transition'):
+        raise ValueError('feature_match must be identity or transition')
+    truth_sets = delta_to_sets(truth, directed, feature_match)
+    pred_sets = delta_to_sets(prediction, directed, feature_match)
 
     scores = {edit_type: calculate_metrics(truth_sets[edit_type], pred_sets[edit_type])
               for edit_type in EDIT_TYPES}
@@ -63,10 +68,12 @@ def score_delta(truth, prediction, directed=False):
     truth_edges = {('+',) + e for e in truth_sets['edges_added']} | {('-',) + e for e in truth_sets['edges_removed']}
     pred_edges = {('+',) + e for e in pred_sets['edges_added']} | {('-',) + e for e in pred_sets['edges_removed']}
     scores['edges'] = calculate_metrics(truth_edges, pred_edges)
+    for key in ('nodes_added', 'nodes_removed'):
+        scores[key] = calculate_metrics(truth_sets[key], pred_sets[key])
     return scores
 
 
-def parse_extraction(text):
+def parse_extraction(text, strict=False, directed=False, feature_match='identity'):
     """Parse the judge's answer into a typed delta.
 
     Accepts a bare JSON object or one inside a ```json fence. Edges may come
@@ -74,7 +81,13 @@ def parse_extraction(text):
     {node, feature} objects or "node:feature" strings. Returns None when no
     JSON object can be read.
     """
-    if not text:
+    if strict:
+        from src.utils.probe_common import read_object, validate_delta
+        try:
+            return validate_delta(read_object(text), directed, feature_match=feature_match)
+        except ValueError:
+            return None
+    if not isinstance(text, str) or not text:
         return None
     match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
     candidate = match.group(1) if match else text
@@ -85,41 +98,45 @@ def parse_extraction(text):
         raw = json.loads(candidate[start:end + 1])
     except json.JSONDecodeError:
         return None
-    if not isinstance(raw, dict):
+    if not isinstance(raw, dict) or not any(k in raw for k in EDIT_TYPES):
         return None
 
     delta = {'edges_added': [], 'edges_removed': [], 'features_changed': []}
     for edit_type in ('edges_added', 'edges_removed'):
-        for item in raw.get(edit_type) or []:
+        values = raw.get(edit_type, [])
+        if not isinstance(values, list):
+            return None
+        for item in values:
             edge = _parse_edge(item)
-            if edge is not None:
-                delta[edit_type].append(edge)
-    for item in raw.get('features_changed') or []:
+            if edge is None:
+                return None
+            delta[edit_type].append(edge)
+    values = raw.get('features_changed', [])
+    if not isinstance(values, list):
+        return None
+    for item in values:
         change = _parse_feature_change(item)
-        if change is not None:
-            delta['features_changed'].append(change)
+        if change is None:
+            return None
+        delta['features_changed'].append(change)
     return delta
 
 
 def _parse_edge(item):
     if isinstance(item, (list, tuple)) and len(item) == 2:
-        try:
-            return [int(item[0]), int(item[1])]
-        except (TypeError, ValueError):
-            return None
+        return list(item) if all(type(v) is int and v >= 0 for v in item) else None
     if isinstance(item, str):
-        found = re.findall(r'\d+', item)
-        if len(found) == 2:
-            return [int(found[0]), int(found[1])]
+        match = re.fullmatch(r'\s*(\d+)\s*(?:--|->|-)\s*(\d+)\s*', item)
+        if match:
+            return [int(match[1]), int(match[2])]
     return None
 
 
 def _parse_feature_change(item):
     if isinstance(item, dict) and 'node' in item and 'feature' in item:
-        try:
-            return {'node': int(item['node']), 'feature': str(item['feature'])}
-        except (TypeError, ValueError):
+        if type(item['node']) is not int or item['node'] < 0 or not str(item['feature']).strip():
             return None
+        return {'node': item['node'], 'feature': str(item['feature'])}
     if isinstance(item, str) and ':' in item:
         node, feature = item.split(':', 1)
         if node.strip().isdigit():

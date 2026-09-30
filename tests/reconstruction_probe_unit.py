@@ -25,6 +25,7 @@ def _load(name, module_name):
 
 for pkg in ('src', 'src.utils'):
     sys.modules.setdefault(pkg, types.ModuleType(pkg))
+_load('probe_common.py', 'src.utils.probe_common')
 _load('reconstruction_metrics.py', 'src.utils.reconstruction_metrics')
 probe = _load('reconstruction_probe.py', 'src.utils.reconstruction_probe')
 

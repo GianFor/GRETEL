@@ -25,6 +25,8 @@ from src.core.factory_base import get_instance_kvargs
 from src.evaluation.future.stages.stage import Stage
 from src.future.explanation.base import Explanation
 from src.utils import reconstruction_probe
+from src.utils import probe_inputs
+from src.utils.probe_common import check_judge
 
 NARRATIVES_STAGE = 'src.evaluation.future.stages.llm_explanation.LLMexplanation'
 DELTA_STAGE = 'src.evaluation.future.stages.typed_delta.TypedDelta'
@@ -40,26 +42,44 @@ class Reconstruction(Stage):
             raise ValueError('Reconstruction needs a "judge" LLM snippet in its parameters')
         p.setdefault('context', 'off')
         p.setdefault('mode', 'full')
+        p.setdefault('narratives_stage', NARRATIVES_STAGE)
+        p.setdefault('feature_match', 'identity')
+        p.setdefault('judge_family', None)
         if p['context'] not in ('on', 'off'):
             raise ValueError('Reconstruction "context" must be "on" or "off"')
         if p['mode'] not in ('full', 'dict'):
             raise ValueError('Reconstruction "mode" must be "full" or "dict"')
+        if p['feature_match'] not in ('identity', 'transition'):
+            raise ValueError('Invalid feature matching')
 
     def init(self):
         super().init()
         p = self.local_config['parameters']
         self.use_context = p['context'] == 'on'
         self.mode = p['mode']
-        self.judge = get_instance_kvargs(p['judge']['class'],
-                                         {'context': self.context, 'local_config': p['judge']})
+        self.judge = None
 
     def process(self, explanation: Explanation) -> Explanation:
-        narratives = explanation.stages_info.get(NARRATIVES_STAGE)
+        p = self.local_config['parameters']
+        if self.judge is None:
+            self.judge = get_instance_kvargs(p['judge']['class'],
+                                            {'context': self.context, 'local_config': p['judge']})
+        narratives = explanation.stages_info.get(p['narratives_stage'])
+        if narratives is not None and narratives.get('schema_version') == 1:
+            check_judge(self.judge.local_config, narratives, p['judge_family'])
+            records = probe_inputs.run_saved('reconstruction', self.judge, narratives,
+                                            p['context'], p['mode'], p['feature_match'])
+            self.write_into_explanation(explanation, {'context': p['context'], 'mode': p['mode'],
+                                                     'counterfactuals': records,
+                                                     'summary': probe_inputs.summarize('reconstruction', records)})
+            return explanation
         deltas = explanation.stages_info.get(DELTA_STAGE)
         if narratives is None or deltas is None:
             raise RuntimeError('Reconstruction must run after LLMexplanation and TypedDelta in the pipeline')
 
         directed = explanation.input_instance.directed
+        if len({len(narratives['direct_explanation']), len(narratives['graph_text']), len(deltas['counterfactuals'])}) != 1:
+            raise ValueError('Narratives and counterfactual deltas are not aligned')
         items = [(output, graph_text, truth, directed)
                  for output, graph_text, truth in zip(narratives['direct_explanation'],
                                                       narratives['graph_text'],

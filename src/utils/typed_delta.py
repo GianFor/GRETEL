@@ -12,8 +12,9 @@ The delta has one list per edit type:
     features_changed               {node, feature, from, to} for nodes present
                                    in both graphs
 
-Edge features and edge weights are not compared: the oracles in use ignore
-them, so editing them cannot flip a prediction.
+Edge features and edge weights are outside this schema. The paper generation
+stage rejects changes to these attributes on existing edges rather than
+treating them as an empty delta. Undirected self-loops are included.
 """
 import numpy as np
 
@@ -22,7 +23,7 @@ def _edge_set(adj, directed):
     rows, cols = np.nonzero(adj)
     if directed:
         return {(int(i), int(j)) for i, j in zip(rows, cols)}
-    return {(int(min(i, j)), int(max(i, j))) for i, j in zip(rows, cols) if i != j}
+    return {(int(min(i, j)), int(max(i, j))) for i, j in zip(rows, cols)}
 
 
 def typed_delta(adj, adj_cf, node_features, node_features_cf, directed=False,
