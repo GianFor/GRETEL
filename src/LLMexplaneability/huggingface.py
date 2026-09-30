@@ -24,6 +24,7 @@ Parameters (all hashed into the component name):
 Weights are cached under HF_HOME; point it at a large disk.
 """
 import re
+import os
 
 from src.core.llm_base import LLM
 from src.utils.logger import GLogger
@@ -78,6 +79,8 @@ class HuggingFaceLLM(LLM):
     # ------------------------------------------------------------------
 
     def _init_vllm(self, p):
+        # GRETEL may initialize CUDA while preparing the oracle before this model.
+        os.environ.setdefault('VLLM_WORKER_MULTIPROC_METHOD', 'spawn')
         from vllm import LLM as VllmEngine, SamplingParams
         self.llm = VllmEngine(model=self.model_id,
                               dtype=p['dtype'],
@@ -118,7 +121,20 @@ class HuggingFaceLLM(LLM):
 
     @staticmethod
     def _clean(text):
-        return _THINK_BLOCK.sub('', text or '').strip()
+        if '<think>' in (text or '') and '</think>' not in text:
+            return ''  # Incomplete reasoning is not a final answer.
+        text = _THINK_BLOCK.sub('', text or '').strip()
+        # Keep the final channel when gpt-oss returns Harmony channel markers.
+        if '<|channel|>final' in text:
+            text = text.rsplit('<|channel|>final', 1)[1]
+            text = text.removeprefix('<|message|>')
+        elif 'assistantfinal' in text and 'assistantanalysis' in text:
+            text = text.rsplit('assistantfinal', 1)[1]
+        elif '<|channel|>analysis' in text or '<|channel|>commentary' in text:
+            return ''
+        for marker in ('<|fim_suffix|>', '<|im_end|>', '<|return|>', '<|end|>'):
+            text = text.replace(marker, '')
+        return text.strip()
 
     def explain_counterfactual(self, system, prompt):
         return self.explain_many([(system, prompt)])[0]
@@ -145,4 +161,5 @@ class HuggingFaceLLM(LLM):
         with self.torch.no_grad():
             output = self.model.generate(**inputs, **generate_kwargs)
         generated = output[0][inputs['input_ids'].shape[1]:]
-        return self._clean(self.tokenizer.decode(generated, skip_special_tokens=True))
+        # Preserve channel markers so analysis and final remain distinguishable.
+        return self._clean(self.tokenizer.decode(generated, skip_special_tokens=False))
