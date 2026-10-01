@@ -128,7 +128,8 @@ class HuggingFaceLLM(LLM):
         if '<|channel|>final' in text:
             text = text.rsplit('<|channel|>final', 1)[1]
             text = text.removeprefix('<|message|>')
-        elif 'assistantfinal' in text and 'assistantanalysis' in text:
+        elif text.startswith(('analysis', 'assistantanalysis', 'assistantfinal')) and 'assistantfinal' in text:
+            # Some vLLM outputs start at the analysis channel, without the role.
             text = text.rsplit('assistantfinal', 1)[1]
         elif '<|channel|>analysis' in text or '<|channel|>commentary' in text:
             return ''

@@ -167,7 +167,7 @@ Reconstruction/Recourse require only a valid direct answer; a failed inverse
 does not block them. Reversal requires both answers. Older schema-1 dumps remain
 readable: outcomes are derived from saved backend metadata and actual responses.
 Summaries include generation status counts per direction. Offline manifests
-include probe `protocol_version: 2` so results from the no-reuse protocol do not
+include probe `protocol_version: 3` so corrected judge decoding results do not
 overwrite results from the earlier protocol under the same run identity.
 
 Summaries expose total counts, status counts, number scored, means over valid
@@ -190,6 +190,10 @@ returns exit 2 after saving results if any attempt failed.
 The HuggingFace backend retains the final channel and rejects incomplete
 reasoning-only answers. Harmony markers follow the model's
 [official chat template](https://huggingface.co/openai/gpt-oss-20b/blob/main/chat_template.jinja).
+It also recognizes flattened `analysis...assistantfinalYES` outputs observed
+on the cluster, even without an initial `assistantanalysis` role prefix.
+Reversal still requires exactly YES or NO in the final answer; extra prose is
+an error. Version 3 gives these corrected results a separate run identity.
 This parsing check does not replace a live backend smoke test.
 
 ## First real-model TreeCycles pilot

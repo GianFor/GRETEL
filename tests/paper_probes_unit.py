@@ -223,6 +223,53 @@ class GeneralContracts(unittest.TestCase):
         self.assertEqual(HuggingFaceLLM._clean('<think>unfinished'), '')
         self.assertEqual(HuggingFaceLLM._clean('<think>reasoning</think>YES'), 'YES')
 
+    def test_backend_keeps_flattened_harmony_final_without_assistant_analysis(self):
+        from src.LLMexplaneability.huggingface import HuggingFaceLLM
+        for text, expected in (
+            ('analysisWe checked both directions. So YES.assistantfinalYES', 'YES'),
+            ('analysisThe classes do not swap.assistantfinalNO', 'NO'),
+            ('assistantanalysisReasoning.assistantfinalYES', 'YES'),
+            ('assistantfinalYES', 'YES'),
+            ('analysisReasoning.assistantfinal{"edges_added": []}', '{"edges_added": []}'),
+            ('{"narrative": "The label is assistantfinal."}', '{"narrative": "The label is assistantfinal."}'),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(HuggingFaceLLM._clean(text), expected)
+
+    def test_reversal_flattened_harmony_final_still_requires_exact_verdict(self):
+        from src.LLMexplaneability.huggingface import HuggingFaceLLM
+        forward = delta(added=[[8, 9]])
+        backward = inverse_delta(forward)
+        for final, status, consistent in (
+            ('YES', 'success', True), ('NO', 'success', False),
+            ('YES because the edits are inverse', 'partial_error', None),
+            ('', 'partial_error', None),
+        ):
+            with self.subTest(final=final):
+                replies = iter([json.dumps(forward), json.dumps(backward),
+                                'analysisThe pair was examined.assistantfinal' + final])
+                calls = []
+                def chat(messages, sampling, **kwargs):
+                    calls.extend(messages)
+                    return [types.SimpleNamespace(outputs=[types.SimpleNamespace(text=next(replies))])
+                            for _ in messages]
+                # Exercise the real backend answer path without loading model weights.
+                judge = HuggingFaceLLM.__new__(HuggingFaceLLM)
+                judge.engine, judge.sampling, judge.chat_kwargs = 'vllm', None, {}
+                judge.llm = types.SimpleNamespace(chat=chat)
+                record = reversal_probe.run(judge, [(answer(forward), answer(backward), '', '', False)],
+                                            mode='dict', feature_match='transition', require_structured=True)[0]
+                self.assertEqual(record['structural_scores']['edges']['f1'], 1)
+                self.assertEqual(record['status'], status)
+                self.assertEqual(record['semantic'].get('consistent'), consistent)
+                self.assertEqual(record['semantic']['judge_output'], final)
+                self.assertEqual(len(calls), 3)
+                summary = summarize('reversal', [record])
+                self.assertEqual(summary['n_semantic_valid'], int(status == 'success'))
+                self.assertEqual(summary['semantic_yes_count'], int(consistent is True))
+                if status != 'success':
+                    self.assertEqual(record['semantic']['status'], 'judge_unparsed')
+
     def test_recourse_control_differs_only_by_explanation(self):
         a = recourse_probe.build_prompt('graph', 'edits', 'domain', 'narrative', 1)
         b = recourse_probe.build_prompt('graph', 'edits', 'domain', None, 1)
@@ -384,7 +431,7 @@ class TwoPassIntegration(unittest.TestCase):
                 output, errors = execute(ScriptedLLM(context, llm('judge')), dumps, options, context,
                                          list(options['probes']), Path(root) / 'results')
                 self.assertTrue(errors)
-                self.assertEqual(json.loads((output / 'manifest.json').read_text())['protocol_version'], 2)
+                self.assertEqual(json.loads((output / 'manifest.json').read_text())['protocol_version'], 3)
                 for name in options['probes']:
                     path = next((output / name / 'ctx-off_mode-dict').glob('*.json'))
                     result = json.loads(path.read_text())['counterfactuals'][0]
