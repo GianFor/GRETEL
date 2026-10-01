@@ -307,6 +307,19 @@ sequence; these larger settings accommodate the 27–31B checkpoints. Sampling
 is greedy, seed 0, at most 2048 output tokens. This does not guarantee the
 cluster's runtime or available memory: Slurm logs record loading/OOM failures.
 
+Following the supplied Caliban user guide, the batch script requests one task
+with eight CPUs and runs Python through `srun`. Before importing numerical
+libraries it sets OMP threads to the assigned CPU count and OpenBLAS, MKL,
+VECLIB and NumExpr threads to one. The matrix CLI enforces the same limits
+for model commands and uses one thread for preparation/submission/summary
+on the access node. Updating the checkout applies the CLI limits to Python
+processes that have not started yet; it does not reconfigure running processes.
+Slurm keeps the submitted batch script, so changes to shell exports or `srun`
+apply to newly submitted jobs. See [sbatch](https://slurm.schedmd.com/sbatch.html).
+The guide also requires queue and GPU type to be assigned by administrators;
+`cuda`/`gpu:fast` must be an assignment allowed for the user. The guide does
+not specify a numerical GPU memory share or prohibit multiple queued jobs.
+
 Qwen and Gemma receive `enable_thinking=false`; gpt-oss uses low reasoning
 effort. Muse uses its documented system instruction `Reasoning strength: low`
 and the backend keeps its final `to=user` message. These are model-specific

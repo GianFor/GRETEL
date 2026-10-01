@@ -285,6 +285,15 @@ def main(argv=None):
         if name != 'summary':
             command.add_argument('--' + name.split('-')[1], required=True)
     args = parser.parse_args(argv)
+    # Before NumPy/PyTorch imports: respect the cluster's CPU thread policy.
+    # Prepare/submit/summary run on the access node with one thread; model jobs
+    # use their allocated CPUs. This also covers already queued batch scripts
+    # which invoke the current Python file without the newer shell exports.
+    os.environ['OMP_NUM_THREADS'] = (os.environ.get('SLURM_CPUS_PER_TASK', '1')
+        if args.command in ('run-generator', 'run-judge') else '1')
+    for variable in ('OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
+                     'VECLIB_MAXIMUM_THREADS', 'NUMEXPR_NUM_THREADS'):
+        os.environ[variable] = '1'
     if args.command in ('prepare', 'submit'):
         run = prepare(args.config, args.source, args.output)
         if args.command == 'submit':
