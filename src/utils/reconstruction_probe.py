@@ -13,7 +13,7 @@ import json
 import re
 
 from src.utils.reconstruction_metrics import parse_extraction, score_delta
-from src.utils.probe_common import call_many, select_text
+from src.utils.probe_common import call_many, select_text, read_object, validate_delta
 
 JUDGE_SYSTEM_PROMPT = """You are a Graph Modification Extractor.
 Your task is to read a text about a graph counterfactual and list, as structured data, the TECHNICAL MODIFICATIONS it mentions: which edges were added, which edges were removed, and which node features were changed.
@@ -81,9 +81,17 @@ def prepare(output, graph_text, use_context, mode, require_structured=False, dir
 def finish(record, judge_output, truth, directed, strict=False, feature_match='identity'):
     """Parse the judge's answer and score it against the ground truth."""
     record['judge_output'] = judge_output
-    extraction = parse_extraction(judge_output, strict, directed, feature_match)
+    if strict:
+        try:
+            extraction = validate_delta(read_object(judge_output), directed, feature_match=feature_match)
+        except ValueError as exc:
+            record.update(status='judge_unparsed', error=str(exc))
+            return record
+    else:
+        extraction = parse_extraction(judge_output, strict, directed, feature_match)
     if extraction is None:
         record['status'] = 'judge_unparsed'
+        record['error'] = ('Missing model output' if not judge_output else 'Judge output is not a valid delta')
         return record
     record['status'] = 'success'
     record['extraction'] = extraction
@@ -112,9 +120,7 @@ def run(judge, items, use_context, mode, strict=False, feature_match='identity',
         answers = call_many(judge, prompts)
         for index, answer in zip(pending, answers):
             _, _, truth, directed = items[index]
-            records[index]['judge_request'] = answer['judge_request']
-            if answer['status'] != 'success':
-                records[index].update(answer)
-            else:
+            records[index].update(answer)
+            if answer['status'] == 'success':
                 finish(records[index], answer['judge_output'], truth, directed, strict, feature_match)
     return records

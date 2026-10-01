@@ -167,7 +167,7 @@ Reconstruction/Recourse require only a valid direct answer; a failed inverse
 does not block them. Reversal requires both answers. Older schema-1 dumps remain
 readable: outcomes are derived from saved backend metadata and actual responses.
 Summaries include generation status counts per direction. Offline manifests
-include probe `protocol_version: 4` so corrected judge decoding results do not
+include probe `protocol_version: 5` so corrected judge decoding results do not
 overwrite results from the earlier protocol under the same run identity.
 
 Summaries expose total counts, status counts, number scored, means over valid
@@ -352,6 +352,38 @@ records and their effective configurations are under
 `probes/GENERATOR/JUDGE/RUN_HASH/`. Logs remain
 `lab/output/logs/slurm_JOB_ID.out`. Each judge refreshes the aggregate summary;
 the `summary` command can rebuild it at any time.
+
+## Reuse narratives for a judge rerun
+
+After a judge decoding or prompt correction, use a fresh run directory:
+
+```bash
+python scripts/paper_probe_matrix.py rerun-judges --from-matrix /absolute/path/to/previous/matrix
+```
+
+This queues only the three judges, serially with `afterany`. All six generators'
+answers are copied byte for byte after checking source provenance, graph pairs,
+replay configuration and saved generation prompts. Original results stay in
+the previous directory. The new manifest identifies the original generation
+run, effective generator configurations and hashes of the reused files.
+Use repeated `--judge ID` or `--probe NAME` to restrict the rerun, and
+`--dry-run` to prepare the directory and print submission commands.
+
+Protocol 5 keeps Muse's special channel tokens during vLLM decoding
+(`skip_special_tokens=false`, no inserted spaces between special tokens).
+The cleaner selects its final `to=user` message; incomplete analysis stays
+unparsed. Probe answers retain `judge_raw_output` before GRETEL cleaning,
+`finish_reason`, `stop_reason` and `output_token_count`. A `length` finish reason
+records exhaustion of the output budget; it does not by itself invalidate an
+otherwise complete answer. Transformers records raw text and token counts,
+but leaves stop diagnostics null. Raw text is the backend's decoded completion,
+not original token IDs; other models retain their default special-token removal.
+Reconstruction now records a parsing error message as well as its status.
+Recourse displays only typed edits, excluding the source's `size` metadata;
+the validator still rejects unknown output fields and empty proposals.
+New protocol identities and fresh rerun directories keep previous results
+separate from corrected evaluations. Local scripted tests cannot establish
+whether a real model will produce a valid final answer.
 
 ## Local technical feedback
 

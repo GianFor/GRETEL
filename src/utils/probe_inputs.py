@@ -6,7 +6,7 @@ from src.utils.probe_graph import restore
 from src.utils.probe_common import counts, check_judge, saved_generation_outcomes, validate_delta
 
 NARRATIVES_STAGE = 'src.evaluation.future.stages.probe_narratives.ProbeNarratives'
-PROBE_PROTOCOL_VERSION = 4  # Muse final messages and cached model revisions are explicit.
+PROBE_PROTOCOL_VERSION = 5  # Preserve raw answers; Recourse prompts contain only typed edits.
 
 
 def run_saved(name, judge, saved, context='off', mode='dict', feature_match='transition',
@@ -70,7 +70,7 @@ def run_saved(name, judge, saved, context='off', mode='dict', feature_match='tra
                     continue
                 inputs = {'instance': original, 'truth': truth, 'input_label': item['input_label'],
                           'target_label': item['target_label'], 'output': item['direct_output'],
-                          'graph_text': item['graph_text'], 'modifications_text': 'ORIGINAL EDITS:\n' + json.dumps(item['truth']),
+                          'graph_text': item['graph_text'], 'modifications_text': 'ORIGINAL EDITS:\n' + json.dumps(truth),
                           'domain': saved['domain'], 'feature_map': saved['feature_map'],
                           'feature_columns': saved.get('feature_columns'), 'atol': saved.get('atol', 0.0)}
         except Exception as exc:

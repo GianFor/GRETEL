@@ -228,7 +228,8 @@ def saved_generation_outcomes(item):
 def _answer_record(answer):
     if not isinstance(answer, str):
         return {'status': 'model_error', 'judge_output': None, 'error': 'Backend did not return text'}
-    return {'status': 'success', 'judge_output': answer}
+    return {'status': 'success', 'judge_output': str(answer),
+            **getattr(answer, 'llm_metadata', {})}
 
 
 def counts(records):

@@ -265,12 +265,66 @@ class GeneralContracts(unittest.TestCase):
                 self.assertEqual(calls[0]['model'], str(snapshot))
                 self.assertEqual(p['resolved_revision'], 'a' * 40)
                 self.assertEqual(calls[0]['max_num_seqs'], 1)
+                self.assertTrue(judge.sampling['skip_special_tokens'])
                 self.assertNotIn('revision', calls[0])
+                judge.model_id = 'meta-models/Muse-Glimmer-30B'
+                judge._init_vllm(p)
+                self.assertFalse(judge.sampling['skip_special_tokens'])
+                self.assertFalse(judge.sampling['spaces_between_special_tokens'])
                 judge.system_prefix = 'Reasoning strength: low'
                 self.assertEqual(judge._messages('task', 'text')[0]['content'], 'Reasoning strength: low\ntask')
             with patch.dict(sys.modules, {'huggingface_hub': types.SimpleNamespace(try_to_load_from_cache=lambda *a, **k: None)}):
                 with self.assertRaises(FileNotFoundError):
                     judge._model_path(p)
+
+    def test_backend_retains_raw_answers_and_stop_diagnostics_across_probes(self):
+        from src.LLMexplaneability.huggingface import HuggingFaceLLM, _LLMAnswer
+        edit = delta(added=[[0, 1]])
+        final = json.dumps(edit)
+        raw = 'to=self<|message|>draft<|eom|><|start|>assistant to=user<|message|>' + final + '<|eom|>'
+        unfinished = 'analysisRepeated draft {"wrong": 1}'
+        judge = HuggingFaceLLM.__new__(HuggingFaceLLM)
+        judge.engine, judge.sampling, judge.chat_kwargs = 'vllm', None, {}
+        completion = lambda text, reason: types.SimpleNamespace(outputs=[types.SimpleNamespace(
+            text=text, finish_reason=reason, stop_reason=None, token_ids=[1, 2, 3])])
+        judge.llm = types.SimpleNamespace(chat=lambda *a, **k: [completion(raw, 'stop'), completion(unfinished, 'length')])
+        records = reconstruction_probe.run(judge, [(answer(edit), '', edit, False)] * 2,
+            use_context=False, mode='dict', strict=True, feature_match='transition', require_structured=True)
+        self.assertEqual(records[0]['status'], 'success')
+        self.assertEqual(records[0]['judge_output'], final)
+        self.assertEqual(records[0]['judge_raw_output'], raw)
+        self.assertEqual(records[0]['finish_reason'], 'stop')
+        self.assertEqual(records[1]['status'], 'judge_unparsed')
+        self.assertEqual(records[1]['error'], 'Missing model output')
+        self.assertEqual(records[1]['judge_output'], '')
+        self.assertEqual(records[1]['judge_raw_output'], unfinished)
+        self.assertEqual(records[1]['finish_reason'], 'length')
+        self.assertEqual(records[1]['output_token_count'], 3)
+        json.loads(json.dumps(records))  # Diagnostics remain ordinary saved JSON.
+        unknown = reconstruction_probe.run(Replies(json.dumps({**edit, 'size': {}})),
+            [(answer(edit), '', edit, False)], use_context=False, mode='dict', strict=True)[0]
+        self.assertEqual(unknown['error'], 'Unknown delta fields')
+        self.assertEqual(HuggingFaceLLM._clean('Analysis of edits'), 'Analysis of edits')
+        copied = copy.deepcopy(judge.explain_counterfactual('system', 'prompt'))
+        self.assertEqual(copied, final)
+        self.assertEqual(copied.llm_metadata['judge_raw_output'], raw)
+        inverse = inverse_delta(edit)
+        semantic_raw = 'analysisChecked both directions.assistantfinalYES'
+        r = reversal_probe.run(Replies(_LLMAnswer(final, raw, 'stop'), json.dumps(inverse),
+            _LLMAnswer('YES', semantic_raw, 'stop')),
+            [(answer(edit), answer(inverse), '', '', False)], mode='dict', require_structured=True)[0]
+        self.assertEqual(r['status'], 'success')
+        self.assertEqual(r['forward']['judge_raw_output'], raw)
+        self.assertEqual(r['semantic']['judge_raw_output'], semantic_raw)
+        g = GraphInstance(1, 0, np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]]))
+        truth = delta(added=[[0, 2]])
+        item = dict(instance=g, output=answer(truth), truth=truth, input_label=0, target_label=1,
+                    graph_text='graph', modifications_text='edits', domain='domain', feature_map={})
+        proposal = json.dumps(delta(removed=[[0, 1]]))
+        r = recourse_probe.run(Replies(_LLMAnswer(proposal, 'raw proposal', 'stop')),
+            [item], lambda graph: 0, mode='dict', control=False, require_structured=True)[0]
+        self.assertEqual(r['status'], 'success')
+        self.assertEqual(r['with_explanation']['judge_raw_output'], 'raw proposal')
 
     def test_reversal_flattened_harmony_final_still_requires_exact_verdict(self):
         from src.LLMexplaneability.huggingface import HuggingFaceLLM
@@ -467,7 +521,7 @@ class TwoPassIntegration(unittest.TestCase):
                 output, errors = execute(ScriptedLLM(context, llm('judge')), dumps, options, context,
                                          list(options['probes']), Path(root) / 'results')
                 self.assertTrue(errors)
-                self.assertEqual(json.loads((output / 'manifest.json').read_text())['protocol_version'], 4)
+                self.assertEqual(json.loads((output / 'manifest.json').read_text())['protocol_version'], 5)
                 for name in options['probes']:
                     path = next((output / name / 'ctx-off_mode-dict').glob('*.json'))
                     result = json.loads(path.read_text())['counterfactuals'][0]
@@ -643,6 +697,85 @@ class ModelMatrixIntegration(unittest.TestCase):
             self.assertEqual(record['inverse_output'], '{}')
             self.assertEqual(run_saved('reconstruction', ScriptedLLM(context, llm('judge')), result)[0]['status'], 'success')
             self.assertEqual(run_saved('reversal', ScriptedLLM(context, llm('judge')), result)[0]['error_origin'], 'generator')
+
+    def test_saved_recourse_prompt_has_only_edits_without_changing_truth(self):
+        with tempfile.TemporaryDirectory(prefix='gretel-recourse-prompt-') as root:
+            context, _, dumps, _, _ = integrated_run(root, samples=1)
+            saved = copy.deepcopy(dumps[0][1]['data'])
+            original = copy.deepcopy(saved)
+            captured = []
+            def probe(judge, items, *args):
+                captured.extend(items)
+                return [{'status': 'success'} for _ in items]
+            with patch.object(recourse_probe, 'run', side_effect=probe):
+                run_saved('recourse', ScriptedLLM(context, llm('judge')), saved,
+                          predictor=lambda graph: original['counterfactuals'][0]['target_label'])
+            self.assertIn('size', original['counterfactuals'][0]['truth'])
+            self.assertNotIn('size', json.loads(captured[0]['modifications_text'].split('\n', 1)[1]))
+            self.assertEqual(saved, original)
+
+    def test_judge_rerun_preserves_narratives_and_queues_only_selected_judges(self):
+        from scripts.run_paper_probes import load_dumps
+        with tempfile.TemporaryDirectory(prefix='gretel-rerun-') as root:
+            matrix, config, run, context, originals = self.prepare_fixture(root)
+            factory = get_instance_kvargs
+            def scripted_model(class_name, kwargs):
+                if class_name != 'src.LLMexplaneability.huggingface.HuggingFaceLLM':
+                    return factory(class_name, kwargs)
+                return ScriptedLLM(kwargs['context'], {'class': 'probes_fixtures.ScriptedLLM',
+                    'parameters': {'role': 'generator', 'model': kwargs['local_config']['parameters']['model']}})
+            with patch('src.core.factory_base.get_instance_kvargs', side_effect=scripted_model):
+                for entry in config['generators']:
+                    Context._Context__global = None
+                    matrix.run_generator(run, entry['id'])
+            matrix.write_json(run / 'probes/old/old/old/summary.json', [{'old': True}])
+            config_path = Path(root) / 'matrix-config.json'
+            new = Path(root) / 'rerun'
+            with patch.object(matrix.subprocess, 'check_output', return_value='0' * 40 + '\n'):
+                all_judges = matrix.prepare_judge_rerun(config_path, run, Path(root) / 'all-judges')
+                matrix.prepare_judge_rerun(config_path, run, new,
+                    judges=['muse-glimmer-30b'], probes=['reconstruction'])
+            with patch.object(matrix.subprocess, 'run', side_effect=[types.SimpleNamespace(stdout=str(i) + '\n')
+                    for i in range(541500, 541503)]) as sbatch:
+                matrix.submit(all_judges, include_generators=False)
+            commands = [call.args[0] for call in sbatch.call_args_list]
+            self.assertEqual([cmd[-3] for cmd in commands], ['matrix-judge'] * 3)
+            self.assertIn('--dependency=afterany:541500', commands[1])
+            self.assertIn('--dependency=afterany:541501', commands[2])
+            self.assertFalse((new / 'probes').exists())
+            for entry in config['generators']:
+                old_files = load_dumps(run / 'generated' / entry['id'])
+                new_files = load_dumps(new / 'generated' / entry['id'])
+                self.assertEqual([p.read_bytes() for p, _, _ in old_files], [p.read_bytes() for p, _, _ in new_files])
+            with patch.object(matrix.subprocess, 'run', return_value=types.SimpleNamespace(stdout='541400\n')) as sbatch:
+                matrix.submit(new, include_generators=False)
+            self.assertEqual(sbatch.call_count, 1)
+            self.assertEqual(sbatch.call_args.args[0][-3:], ['matrix-judge', str(new), 'muse-glimmer-30b'])
+            settings = json.loads((new / 'configs/judge-muse-glimmer-30b.json').read_text())
+            settings.pop('compose_strs')
+            settings['store_paths'] = context.conf['store_paths']
+            matrix.write_json(new / 'configs/judge-muse-glimmer-30b.json', settings)
+            judge = ScriptedLLM(context, llm('judge'))
+            Context._Context__global = None
+            with patch('src.core.factory_base.get_instance_kvargs', return_value=judge) as load:
+                self.assertEqual(matrix.run_judge(new, 'muse-glimmer-30b'), 0)
+            self.assertEqual(load.call_count, 1)
+            rows, cells = matrix.collect(new)
+            self.assertEqual(len(rows), 6)
+            self.assertTrue(all(row['n'] == 5 and row['n_success'] == 5 for row in rows))
+            self.assertTrue(all(cell['status'] == 'complete' for cell in cells))
+            # Reruns are themselves reusable; corrupted narratives fail before preparation.
+            with patch.object(matrix.subprocess, 'check_output', return_value='0' * 40 + '\n'):
+                matrix.prepare_judge_rerun(config_path, new, Path(root) / 'rerun-again')
+            file = load_dumps(run / 'generated' / config['generators'][0]['id'])[0][0]
+            payload = json.loads(file.read_text())
+            payload['data']['counterfactuals'][0]['input_label'] = 100
+            matrix.write_json(file, payload)
+            with self.assertRaisesRegex(ValueError, 'changed graph pair'):
+                matrix.prepare_judge_rerun(config_path, run, Path(root) / 'bad-rerun')
+            self.assertFalse((Path(root) / 'bad-rerun').exists())
+            with self.assertRaisesRegex(ValueError, 'Unknown judge'):
+                matrix.prepare_judge_rerun(config_path, new, Path(root) / 'unknown', judges=['unknown'])
 
     def test_source_validation_and_cached_judge_failure_are_visible(self):
         with tempfile.TemporaryDirectory(prefix='gretel-matrix-errors-') as root:

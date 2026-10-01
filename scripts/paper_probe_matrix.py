@@ -4,6 +4,7 @@
 Run from the GRETEL root. submit prepares an immutable source copy and queues
 six generator jobs followed by three judge jobs. Each judge loads once and
 evaluates all generator outputs. summary also works while jobs are running.
+rerun-judges creates a fresh matrix using the saved generator answers.
 """
 import argparse
 import copy
@@ -130,7 +131,96 @@ def prepare(config_path, source, destination=None):
     return run
 
 
-def submit(run, dry_run=False):
+def prepare_judge_rerun(config_path, previous, destination=None, judges=None, probes=None):
+    """Freeze existing narratives unchanged; use current judge configurations."""
+    print('Preparing judge rerun from:', previous, flush=True)
+    from scripts.run_paper_probes import load_dumps
+    previous = Path(previous).resolve()
+    old = json.loads((previous / 'matrix.json').read_text())
+    sources = frozen_dumps(previous)
+    validate_sources(sources, old['configuration'])
+    available = json.loads(Path(config_path).read_text())
+    config = copy.deepcopy(old['configuration'])
+    selected = set(judges or [entry['id'] for entry in config['judges']])
+    current = {entry['id']: entry for entry in available['judges']}
+    if not selected or selected - set(current):
+        raise ValueError('Unknown judge selection')
+    # Expand the current defaults now: old generator settings stay in the manifest.
+    config['judges'] = [copy.deepcopy(entry) for entry in available['judges'] if entry['id'] in selected]
+    for entry in config['judges']:
+        entry['parameters'] = {**available['model_defaults'], **entry['parameters']}
+    if probes:
+        if set(probes) - set(config['probes']):
+            raise ValueError('Unknown probe selection')
+        config['probes'] = {name: value for name, value in config['probes'].items() if name in probes}
+    copied = []
+    source_map = {payload['id']: (path, payload, digest) for path, payload, digest in sources}
+    if len(source_map) != len(sources):
+        raise ValueError('Repeated instance ID; select one source run/fold')
+    generation_sources = old.get('generation_sources', old['sources'])
+    provenance = {source['id']: {'sha256': source['sha256'], 'path': source['frozen']}
+                  for source in generation_sources}
+    for entry in config['generators']:
+        directory = previous / 'generated' / entry['id']
+        generation = json.loads((directory / 'generation.json').read_text())
+        if generation['source_fingerprint'] != old['source_fingerprint']:
+            raise ValueError('Different graph pairs used by this generator')
+        if generation['generator']['parameters']['model'] != entry['parameters']['model']:
+            raise ValueError('Saved generator model disagrees with matrix')
+        dumps = load_dumps(directory)
+        validate_sources(dumps, config)
+        for path, payload, digest in dumps:
+            _, source, source_digest = source_map[payload['id']]
+            if (payload.get('matrix_source') != provenance[payload['id']]
+                    or provenance[payload['id']]['sha256'] != source_digest):
+                raise ValueError('Saved generation provenance disagrees with frozen source')
+            if payload['data']['generator'] != generation['generator']:
+                raise ValueError('Saved generator configuration disagrees with generation manifest')
+            for key in ('dataset', 'oracle', 'domain', 'feature_map', 'feature_columns', 'atol'):
+                if payload['data'].get(key) != source['data'].get(key):
+                    raise ValueError('Saved generation changed replay configuration')
+            before, after = source['data']['counterfactuals'][0], payload['data']['counterfactuals'][0]
+            for key in ('input', 'counterfactual', 'truth', 'input_label', 'target_label', 'graph_text', 'inverse_graph_text'):
+                if before.get(key) != after.get(key):
+                    raise ValueError('Saved generation changed graph pair')
+            for direction in ('direct', 'inverse'):
+                key = direction + '_generation'
+                if before[key]['judge_request'] != after[key]['judge_request']:
+                    raise ValueError('Saved generation changed original prompt')
+        copied.append((entry['id'], generation, dumps))
+    # All inputs are checked before creating a run or submitting any job.
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as stream:
+            temporary = stream.name
+            json.dump(config, stream)
+        run = prepare(temporary, previous / 'source', destination)
+    finally:
+        if temporary:
+            os.unlink(temporary)
+    manifest = json.loads((run / 'matrix.json').read_text())
+    manifest['reuse_generations_from'] = str(previous)
+    manifest['generation_sources'] = generation_sources
+    write_json(run / 'matrix.json', manifest)
+    for tag, generation, dumps in copied:
+        files = []
+        for path, payload, digest in dumps:
+            content = path.read_bytes()
+            if hashlib.sha256(content).hexdigest() != digest:
+                raise ValueError('Generator output changed while preparing rerun')
+            target = run / 'generated' / tag / 'probe_inputs' / path.name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+            files.append({'path': str(target.relative_to(run)), 'sha256': digest})
+        write_json(run / 'generated' / tag / 'generation.json', {**generation,
+            'source_fingerprint': manifest['source_fingerprint'],
+            'original_source_fingerprint': old['source_fingerprint'],
+            'generation_reused_from': str(previous / 'generated' / tag), 'reused_outputs': files})
+    print('Reused generator outputs:', len(copied), '; judge jobs:', len(config['judges']), flush=True)
+    return run
+
+
+def submit(run, dry_run=False, include_generators=True):
     config = json.loads((run / 'matrix.json').read_text())['configuration']
     settings = config['slurm']
     ledger = run / 'jobs.jsonl'
@@ -138,7 +228,10 @@ def submit(run, dry_run=False):
         raise ValueError('Jobs already submitted; use a new matrix run')
     (ROOT / 'lab/output/logs').mkdir(parents=True, exist_ok=True)
     previous = None
-    for role, entries in (('generator', config['generators']), ('judge', config['judges'])):
+    roles = [('judge', config['judges'])]
+    if include_generators:
+        roles.insert(0, ('generator', config['generators']))
+    for role, entries in roles:
         for entry in entries:
             cmd = ['sbatch', '--parsable', '--chdir=' + str(ROOT), '--nodelist=' + settings['node'],
                    '--time=' + settings['time'], '--mem=' + settings['mem'],
@@ -228,6 +321,9 @@ def run_judge(run, tag):
             generation = json.loads((run / 'generated' / g / 'generation.json').read_text())
             if generation['source_fingerprint'] != manifest['source_fingerprint']:
                 raise ValueError('Different graph pairs used by this generator')
+            for source in generation.get('reused_outputs', []):
+                if hashlib.sha256((run / source['path']).read_bytes()).hexdigest() != source['sha256']:
+                    raise ValueError('Reused generator output was modified')
             dumps = load_dumps(run / 'generated' / g)
             if len(dumps) != len(manifest['sources']):
                 raise ValueError('Incomplete generator outputs')
@@ -279,6 +375,13 @@ def main(argv=None):
         command.add_argument('--output')
         if name == 'submit':
             command.add_argument('--dry-run', action='store_true')
+    rerun = commands.add_parser('rerun-judges')
+    rerun.add_argument('--from-matrix', required=True)
+    rerun.add_argument('--config', default=DEFAULT_CONFIG)
+    rerun.add_argument('--output')
+    rerun.add_argument('--judge', action='append')
+    rerun.add_argument('--probe', action='append')
+    rerun.add_argument('--dry-run', action='store_true')
     for name in ('run-generator', 'run-judge', 'summary'):
         command = commands.add_parser(name)
         command.add_argument('--run-root', required=True)
@@ -298,6 +401,10 @@ def main(argv=None):
         run = prepare(args.config, args.source, args.output)
         if args.command == 'submit':
             submit(run, args.dry_run)
+        return 0
+    if args.command == 'rerun-judges':
+        run = prepare_judge_rerun(args.config, args.from_matrix, args.output, args.judge, args.probe)
+        submit(run, args.dry_run, include_generators=False)
         return 0
     run = Path(args.run_root).resolve()
     if args.command == 'run-generator':

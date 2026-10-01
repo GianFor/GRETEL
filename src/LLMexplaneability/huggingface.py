@@ -23,6 +23,7 @@ Parameters (all hashed into the component name):
 - max_num_seqs, limit_mm_per_prompt: optional vllm concurrency/modality limits
 - revision: checkpoint commit or ref; local_files_only uses its cached snapshot
 - system_prefix: model-specific system instruction, e.g. Muse reasoning strength
+- skip_special_tokens: vllm decoding; defaults to False for Muse channel framing
 
 Weights are cached under HF_HOME; point it at a large disk.
 """
@@ -35,6 +36,21 @@ from src.utils.logger import GLogger
 
 # Hybrid models emit an (often empty) think block before the answer
 _THINK_BLOCK = re.compile(r'<think>.*?</think>\s*', re.DOTALL)
+
+
+class _LLMAnswer(str):
+    """Keep the text API while carrying decoding diagnostics to probe records."""
+
+    def __new__(cls, text, raw, finish_reason=None, stop_reason=None, token_count=None):
+        answer = super().__new__(cls, text)
+        answer.llm_metadata = {'judge_raw_output': raw, 'finish_reason': finish_reason,
+                               'stop_reason': stop_reason, 'output_token_count': token_count}
+        return answer
+
+    def __reduce_ex__(self, protocol):
+        m = self.llm_metadata
+        return type(self), (str(self), m['judge_raw_output'], m['finish_reason'],
+                           m['stop_reason'], m['output_token_count'])
 
 
 class HuggingFaceLLM(LLM):
@@ -63,8 +79,11 @@ class HuggingFaceLLM(LLM):
         p.setdefault('system_prefix', '')
         p.setdefault('max_num_seqs', None)
         p.setdefault('limit_mm_per_prompt', None)
+        p.setdefault('skip_special_tokens', 'muse-glimmer' not in p['model'].lower())
         if type(p['local_files_only']) is not bool or not isinstance(p['system_prefix'], str):
             raise ValueError('local_files_only must be boolean and system_prefix must be text')
+        if type(p['skip_special_tokens']) is not bool:
+            raise ValueError('skip_special_tokens must be boolean')
 
     def init(self):
         super().init()
@@ -109,7 +128,10 @@ class HuggingFaceLLM(LLM):
                               max_model_len=p['max_model_len'],
                               seed=self.seed, **extra)
         self.sampling = SamplingParams(temperature=self.temperature, top_p=self.top_p,
-                                       max_tokens=self.max_new_tokens, seed=self.seed)
+                                       max_tokens=self.max_new_tokens, seed=self.seed,
+                                       skip_special_tokens=p.get('skip_special_tokens',
+                                           'muse-glimmer' not in self.model_id.lower()),
+                                       spaces_between_special_tokens=False)
 
     def _init_transformers(self, p):
         import torch
@@ -182,6 +204,8 @@ class HuggingFaceLLM(LLM):
             text = text.rsplit('assistantfinal', 1)[1]
         elif '<|channel|>analysis' in text or '<|channel|>commentary' in text:
             return ''
+        elif re.match(r'^(?:assistant)?analysis(?=\S)', text):
+            return ''  # A flattened analysis channel without a final answer.
         for marker in ('<|fim_suffix|>', '<|im_end|>', '<|return|>', '<|end|>', '<|eom|>'):
             text = text.replace(marker, '')
         return text.strip()
@@ -195,7 +219,16 @@ class HuggingFaceLLM(LLM):
         if self.engine == 'vllm':
             outputs = self.llm.chat(messages, self.sampling, use_tqdm=False,
                                     chat_template_kwargs=self.chat_kwargs)
-            return [self._clean(o.outputs[0].text) for o in outputs]
+            answers = []
+            for output in outputs:
+                completion = output.outputs[0]
+                raw = completion.text
+                tokens = getattr(completion, 'token_ids', None)
+                answers.append(_LLMAnswer(self._clean(raw), raw,
+                    getattr(completion, 'finish_reason', None),
+                    getattr(completion, 'stop_reason', None),
+                    len(tokens) if tokens is not None else None))
+            return answers
         return [self._generate_one(m) for m in messages]
 
     def _generate_one(self, messages):
@@ -212,4 +245,5 @@ class HuggingFaceLLM(LLM):
             output = self.model.generate(**inputs, **generate_kwargs)
         generated = output[0][inputs['input_ids'].shape[1]:]
         # Preserve channel markers so analysis and final remain distinguishable.
-        return self._clean(self.tokenizer.decode(generated, skip_special_tokens=False))
+        raw = self.tokenizer.decode(generated, skip_special_tokens=False)
+        return _LLMAnswer(self._clean(raw), raw, token_count=len(generated))

@@ -114,7 +114,8 @@
         "system_prefix": "Reasoning strength: low",
         "limit_mm_per_prompt": {
           "image": 0
-        }
+        },
+        "skip_special_tokens": false
       }
     },
     {
