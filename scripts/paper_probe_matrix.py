@@ -43,6 +43,7 @@ def validate_sources(dumps, config):
     from src.utils.probe_common import DELTA_FIELDS, validate_delta
     from src.utils.probe_graph import restore, unsupported_changes
     from src.utils.typed_delta import typed_delta_from_instances
+    print('GRETEL dependencies loaded; checking graph pairs', flush=True)
     if len(dumps) != config['sample_limit']:
         raise ValueError(f'Expected exactly {config["sample_limit"]} source dumps, found {len(dumps)}; select one run/fold')
     seen = set()
@@ -89,6 +90,7 @@ def model_config(config, entry, role):
 
 
 def prepare(config_path, source, destination=None):
+    print('Preparing matrix; configuration:', config_path, flush=True)
     from scripts.run_paper_probes import load_dumps, validate_configuration
     config = json.loads(Path(config_path).read_text())
     validate_configuration(config, list(config['probes']))
@@ -100,10 +102,13 @@ def prepare(config_path, source, destination=None):
         for judge in config['judges']:
             if generator['family'] == judge['family'] or generator['parameters']['model'] == judge['parameters']['model']:
                 raise ValueError('Generator and judge must differ, including family')
+    print('Reading source dumps:', source, flush=True)
     dumps = load_dumps(source)
+    print(f'Found {len(dumps)} dumps; validating inputs and loading GRETEL dependencies', flush=True)
     validate_sources(dumps, config)
     name = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
     run = Path(destination or ROOT / 'lab/output/results' / config['scope'] / name).resolve()
+    print('Saving frozen inputs:', run, flush=True)
     run.mkdir(parents=True, exist_ok=False)
     sources = []
     for path, payload, digest in dumps:
@@ -149,6 +154,7 @@ def submit(run, dry_run=False):
                 print(shlex.join(cmd))
                 previous = '<previous-job>'
             else:
+                print('Submitting', role, entry['id'], flush=True)
                 result = subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True, check=True)
                 previous = result.stdout.strip().split(';')[0]
                 if not previous.isdigit():
