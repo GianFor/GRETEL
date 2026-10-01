@@ -167,7 +167,7 @@ Reconstruction/Recourse require only a valid direct answer; a failed inverse
 does not block them. Reversal requires both answers. Older schema-1 dumps remain
 readable: outcomes are derived from saved backend metadata and actual responses.
 Summaries include generation status counts per direction. Offline manifests
-include probe `protocol_version: 3` so corrected judge decoding results do not
+include probe `protocol_version: 4` so corrected judge decoding results do not
 overwrite results from the earlier protocol under the same run identity.
 
 Summaries expose total counts, status counts, number scored, means over valid
@@ -193,7 +193,8 @@ reasoning-only answers. Harmony markers follow the model's
 It also recognizes flattened `analysis...assistantfinalYES` outputs observed
 on the cluster, even without an initial `assistantanalysis` role prefix.
 Reversal still requires exactly YES or NO in the final answer; extra prose is
-an error. Version 3 gives these corrected results a separate run identity.
+an error. Version 3 separated corrected Harmony results; version 4 also handles
+Muse's `to=self`/`to=user` framing and records cached checkpoint revisions.
 This parsing check does not replace a live backend smoke test.
 
 ## First real-model TreeCycles pilot
@@ -248,6 +249,96 @@ completion alone does not imply successful parsing or successful proposals.
 The waiting policy requires 30000 MiB free on the assigned GPU, with a
 30-minute wait cap for this mini run. This config has been checked locally;
 running real models and reviewing their outputs is the cluster test.
+
+## Cached-model matrix with 10-node TreeCycles
+
+`lab/config/probes/paper_treecycles_10nodes_matrix.json` selects six generators
+(Qwen3.5 2B/4B/9B/27B, Qwen3.8 27B, Gemma4 31B) and three independent judges
+(gpt-oss 20B, Muse-Glimmer 30B, GLM4.7 Flash). The checkpoint commits are taken
+from the cluster smoke-test inventory. Inference uses only those cached
+snapshots under `HF_HOME` (default `$HOME/hf_cache`); a missing checkpoint or
+weight file fails the model job without downloading a replacement.
+[HF cache lookup](https://huggingface.co/docs/huggingface_hub/guides/manage-cache)
+resolves the standard inference snapshot. Other exports such as `original/`
+and `metal/` are not prerequisites for loading the standard weights.
+
+This is a probe matrix over the **five existing graph pairs from the completed
+mini pilot**, not a new CF search per model. Preparation requires exactly five
+valid dumps with one 10-node CF each, distinct instances, correct graph deltas,
+and both saved generation prompts. It freezes the original bytes and verifies
+their SHA256 hashes in subsequent jobs. Every generator receives those same
+direct/inverse prompts and graphs; every judge receives that generator's saved
+answers. The three probes use CTX-off/MODE-dict; Recourse includes both arms.
+
+From the cluster repository root:
+
+```bash
+git pull --ff-only
+python scripts/paper_probe_matrix.py submit
+```
+
+The command prints a new `Matrix:` directory under
+`lab/output/results/paper-probes-matrix-10nodes/` and all nine Slurm job IDs.
+`jobs.jsonl` associates those IDs with the model and role. Six generator jobs
+run first, then three judge jobs. Each judge loads once and evaluates all six
+generators, producing 18 comparisons. `afterany` chains the nine jobs so they
+use one GPU at a time and a failed model does not block the following models.
+A generator initialization failure leaves its comparisons as recorded errors
+when the judges reach them. A judge initialization failure records errors for
+all six comparisons. Parsed content failures remain in per-sample outcomes.
+
+To inspect the commands without submitting anything:
+
+```bash
+python scripts/paper_probe_matrix.py submit --dry-run
+```
+
+This still creates a frozen run directory. `--source /path/to/one/run` selects
+a different source containing exactly five dumps; it defaults to
+`lab/output/results/paper-probes-mini-10nodes`. `--output` chooses a new result
+directory explicitly and refuses an existing directory. If several source
+runs exist, select the intended run instead of combining them.
+
+Resources target the `compute-2-3` H200 used by the smoke test: one `gpu:fast`,
+96 GB host memory, four-hour limit per job. Each job waits at most 30 minutes
+for at least 115000 MiB free GPU memory. vLLM uses `dtype=auto`, native
+checkpoint quantization, 75% GPU memory, 8192 context tokens and one concurrent
+sequence; these larger settings accommodate the 27–31B checkpoints. Sampling
+is greedy, seed 0, at most 2048 output tokens. This does not guarantee the
+cluster's runtime or available memory: Slurm logs record loading/OOM failures.
+
+Qwen and Gemma receive `enable_thinking=false`; gpt-oss uses low reasoning
+effort. Muse uses its documented system instruction `Reasoning strength: low`
+and the backend keeps its final `to=user` message. These are model-specific
+controls, not a guarantee that every model omits reasoning. See the
+[Qwen template](https://huggingface.co/Qwen/Qwen3.5-27B/blob/main/chat_template.jinja),
+[Gemma model card](https://huggingface.co/google/gemma-4-31B-it), and
+[Muse model card](https://huggingface.co/meta-models/Muse-Glimmer-30B).
+The delta validator stays strict: flat edge arrays, unknown fields and extra
+prose after YES/NO are recorded as parsing errors.
+
+For a complete run there are 60 generator answers and up to 540 judge answers
+(Reconstruction 1, Reversal 3, Recourse 2 per sample/comparison). Generator
+parsing failures can reduce judge calls. Five pairs are a pipeline check,
+not enough to establish model rankings.
+
+Use the printed matrix directory to inspect results, also during execution:
+
+```bash
+python scripts/paper_probe_matrix.py summary --run-root /absolute/path/from/Matrix
+```
+
+`matrix-summary.csv` compares probe scores and Recourse rates;
+`matrix-summary.json` retains the full summaries and each comparison's
+`complete/error/pending` state. `complete` means a summary was saved, even if
+some attempts failed: inspect `status_counts` and valid denominators.
+`pending` means no summary or recorded error exists yet; check Slurm for a job
+still queued/running or killed before Python could save an error.
+Generated answers are under `generated/GENERATOR/probe_inputs/`; probe
+records and their effective configurations are under
+`probes/GENERATOR/JUDGE/RUN_HASH/`. Logs remain
+`lab/output/logs/slurm_JOB_ID.out`. Each judge refreshes the aggregate summary;
+the `summary` command can rebuild it at any time.
 
 ## Local technical feedback
 

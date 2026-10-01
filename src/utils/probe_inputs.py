@@ -6,7 +6,7 @@ from src.utils.probe_graph import restore
 from src.utils.probe_common import counts, check_judge, saved_generation_outcomes, validate_delta
 
 NARRATIVES_STAGE = 'src.evaluation.future.stages.probe_narratives.ProbeNarratives'
-PROBE_PROTOCOL_VERSION = 3  # Decode flattened Harmony final answers; preserve earlier runs.
+PROBE_PROTOCOL_VERSION = 4  # Muse final messages and cached model revisions are explicit.
 
 
 def run_saved(name, judge, saved, context='off', mode='dict', feature_match='transition',

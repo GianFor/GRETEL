@@ -20,11 +20,15 @@ Parameters (all hashed into the component name):
   keeps the output to the answer only
 - reasoning_effort: chat-template switch for gpt-oss ("low"|"medium"|"high")
 - tensor_parallel_size, gpu_memory_utilization, max_model_len: vllm only
+- max_num_seqs, limit_mm_per_prompt: optional vllm concurrency/modality limits
+- revision: checkpoint commit or ref; local_files_only uses its cached snapshot
+- system_prefix: model-specific system instruction, e.g. Muse reasoning strength
 
 Weights are cached under HF_HOME; point it at a large disk.
 """
 import re
 import os
+from pathlib import Path
 
 from src.core.llm_base import LLM
 from src.utils.logger import GLogger
@@ -54,6 +58,13 @@ class HuggingFaceLLM(LLM):
         p.setdefault('tensor_parallel_size', 1)
         p.setdefault('gpu_memory_utilization', 0.9)
         p.setdefault('max_model_len', None)
+        p.setdefault('revision', None)
+        p.setdefault('local_files_only', False)
+        p.setdefault('system_prefix', '')
+        p.setdefault('max_num_seqs', None)
+        p.setdefault('limit_mm_per_prompt', None)
+        if type(p['local_files_only']) is not bool or not isinstance(p['system_prefix'], str):
+            raise ValueError('local_files_only must be boolean and system_prefix must be text')
 
     def init(self):
         super().init()
@@ -63,6 +74,7 @@ class HuggingFaceLLM(LLM):
         self.temperature = p['temperature']
         self.top_p = p['top_p']
         self.seed = p['seed']
+        self.system_prefix = p['system_prefix']
         self.max_new_tokens = p['max_new_tokens']
         # Extra variables handed to the chat template; templates that do not
         # know a variable simply ignore it
@@ -82,13 +94,20 @@ class HuggingFaceLLM(LLM):
         # GRETEL may initialize CUDA while preparing the oracle before this model.
         os.environ.setdefault('VLLM_WORKER_MULTIPROC_METHOD', 'spawn')
         from vllm import LLM as VllmEngine, SamplingParams
-        self.llm = VllmEngine(model=self.model_id,
+        model_path = self._model_path(p)
+        extra = {}
+        for key in ('max_num_seqs', 'limit_mm_per_prompt'):
+            if p[key] is not None:
+                extra[key] = p[key]
+        if p['revision'] is not None and not p['local_files_only']:
+            extra['revision'] = p['revision']
+        self.llm = VllmEngine(model=model_path,
                               dtype=p['dtype'],
                               quantization=p['quantization'],
                               tensor_parallel_size=p['tensor_parallel_size'],
                               gpu_memory_utilization=p['gpu_memory_utilization'],
                               max_model_len=p['max_model_len'],
-                              seed=self.seed)
+                              seed=self.seed, **extra)
         self.sampling = SamplingParams(temperature=self.temperature, top_p=self.top_p,
                                        max_tokens=self.max_new_tokens, seed=self.seed)
 
@@ -96,7 +115,11 @@ class HuggingFaceLLM(LLM):
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
         self.torch = torch
-        self.tokenizer = AutoTokenizer.from_pretrained(self.model_id)
+        model_path = self._model_path(p)
+        load_kwargs = {'local_files_only': p['local_files_only']}
+        if p['revision'] is not None and not p['local_files_only']:
+            load_kwargs['revision'] = p['revision']
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, **load_kwargs)
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -110,13 +133,28 @@ class HuggingFaceLLM(LLM):
                 bnb_4bit_quant_type='nf4')
         elif p['dtype'] != 'auto':
             kwargs['dtype'] = getattr(torch, p['dtype'])
-        self.model = AutoModelForCausalLM.from_pretrained(self.model_id, **kwargs)
+        self.model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs, **load_kwargs)
         self.model.eval()
 
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _messages(system, prompt):
+    def _model_path(self, p):
+        if not p['local_files_only']:
+            return self.model_id
+        from huggingface_hub import try_to_load_from_cache
+        config = try_to_load_from_cache(self.model_id, 'config.json', revision=p['revision'])
+        if not isinstance(config, str) or not Path(config).is_file():
+            raise FileNotFoundError(f'No cached config.json for {self.model_id} at {p["revision"] or "main"}')
+        # Use the standard inference snapshot directly; original/metal exports
+        # need not be downloaded. The engine still validates its actual weights.
+        snapshot = Path(config).parent
+        p['resolved_revision'] = snapshot.name
+        return str(snapshot)
+
+    def _messages(self, system, prompt):
+        prefix = getattr(self, 'system_prefix', '')
+        if prefix:
+            system = prefix.rstrip() + '\n' + system
         return [{'role': 'system', 'content': system}, {'role': 'user', 'content': prompt}]
 
     @staticmethod
@@ -124,6 +162,17 @@ class HuggingFaceLLM(LLM):
         if '<think>' in (text or '') and '</think>' not in text:
             return ''  # Incomplete reasoning is not a final answer.
         text = _THINK_BLOCK.sub('', text or '').strip()
+        if '</think>' in text:
+            # The opening think token may be part of the generation prompt.
+            text = text.rsplit('</think>', 1)[1].strip()
+        if text.startswith(('to=self', 'to=user', 'assistant to=self',
+                            'assistant to=user', '<|start|>assistant')):
+            user_messages = list(re.finditer(r'(?:assistant )?to=user<\|message\|>', text))
+            if user_messages:
+                # The assistant role can already be part of the input prompt.
+                text = text[user_messages[-1].end():]
+            elif text.startswith(('to=self', 'assistant to=self', '<|start|>assistant to=self')):
+                return ''
         # Keep the final channel when gpt-oss returns Harmony channel markers.
         if '<|channel|>final' in text:
             text = text.rsplit('<|channel|>final', 1)[1]
@@ -133,7 +182,7 @@ class HuggingFaceLLM(LLM):
             text = text.rsplit('assistantfinal', 1)[1]
         elif '<|channel|>analysis' in text or '<|channel|>commentary' in text:
             return ''
-        for marker in ('<|fim_suffix|>', '<|im_end|>', '<|return|>', '<|end|>'):
+        for marker in ('<|fim_suffix|>', '<|im_end|>', '<|return|>', '<|end|>', '<|eom|>'):
             text = text.replace(marker, '')
         return text.strip()
 

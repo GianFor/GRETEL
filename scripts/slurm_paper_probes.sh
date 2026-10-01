@@ -8,7 +8,7 @@
 #SBATCH -o lab/output/logs/slurm_%j.out
 set -euo pipefail
 
-pass=${1:?usage: generate CONFIG | probe CONFIG RESULTS [PROBE]}
+pass=${1:?usage: generate CONFIG | probe CONFIG RESULTS [PROBE] | matrix-generator/ matrix-judge RUN_ROOT MODEL_ID}
 config=${2:?missing config}
 source ~/miniforge3/etc/profile.d/conda.sh
 conda activate GRTL
@@ -37,6 +37,12 @@ case "$pass" in
     extra=()
     [ -z "${4:-}" ] || extra=(--probe "$4")
     python scripts/run_paper_probes.py --config "$config" --results "$results" --limit "${SAMPLE_LIMIT:-5}" "${extra[@]}"
+    ;;
+  matrix-generator)
+    python scripts/paper_probe_matrix.py run-generator --run-root "$config" --generator "${3:?missing generator ID}"
+    ;;
+  matrix-judge)
+    python scripts/paper_probe_matrix.py run-judge --run-root "$config" --judge "${3:?missing judge ID}"
     ;;
   *) echo "unknown pass: $pass"; exit 2 ;;
 esac

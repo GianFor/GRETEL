@@ -14,6 +14,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -236,6 +237,41 @@ class GeneralContracts(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(HuggingFaceLLM._clean(text), expected)
 
+    def test_backend_keeps_muse_user_response_and_discards_unfinished_self_message(self):
+        from src.LLMexplaneability.huggingface import HuggingFaceLLM
+        for final in ('YES', 'NO', json.dumps(delta(added=[[0, 1]]))):
+            raw = ' to=self<|message|>draft {"wrong":1}<|eom|><|start|>assistant to=user<|message|>' + final + '<|eom|>'
+            self.assertEqual(HuggingFaceLLM._clean(raw), final)
+            self.assertEqual(HuggingFaceLLM._clean(' to=user<|message|>' + final + '<|eom|>'), final)
+        self.assertEqual(HuggingFaceLLM._clean(' to=self<|message|>YES'), '')
+        self.assertEqual(HuggingFaceLLM._clean('reasoning from prompt</think>NO'), 'NO')
+
+    def test_cached_backend_uses_snapshot_without_requiring_other_weight_exports(self):
+        from src.LLMexplaneability.huggingface import HuggingFaceLLM
+        with tempfile.TemporaryDirectory() as root:
+            snapshot = Path(root) / 'snapshots' / ('a' * 40)
+            snapshot.mkdir(parents=True)
+            (snapshot / 'config.json').write_text('{}')
+            calls = []
+            hub = types.SimpleNamespace(try_to_load_from_cache=lambda *args, **kwargs: str(snapshot / 'config.json'))
+            vllm = types.SimpleNamespace(LLM=lambda **kwargs: calls.append(kwargs), SamplingParams=lambda **kwargs: kwargs)
+            judge = HuggingFaceLLM.__new__(HuggingFaceLLM)
+            judge.model_id, judge.seed, judge.temperature, judge.top_p, judge.max_new_tokens = 'openai/gpt-oss-20b', 0, 0, 1, 2048
+            p = {'local_files_only': True, 'revision': 'a' * 40, 'dtype': 'auto', 'quantization': None,
+                 'tensor_parallel_size': 1, 'gpu_memory_utilization': .75, 'max_model_len': 8192,
+                 'max_num_seqs': 1, 'limit_mm_per_prompt': {'image': 0}}
+            with patch.dict(sys.modules, {'huggingface_hub': hub, 'vllm': vllm}):
+                judge._init_vllm(p)
+                self.assertEqual(calls[0]['model'], str(snapshot))
+                self.assertEqual(p['resolved_revision'], 'a' * 40)
+                self.assertEqual(calls[0]['max_num_seqs'], 1)
+                self.assertNotIn('revision', calls[0])
+                judge.system_prefix = 'Reasoning strength: low'
+                self.assertEqual(judge._messages('task', 'text')[0]['content'], 'Reasoning strength: low\ntask')
+            with patch.dict(sys.modules, {'huggingface_hub': types.SimpleNamespace(try_to_load_from_cache=lambda *a, **k: None)}):
+                with self.assertRaises(FileNotFoundError):
+                    judge._model_path(p)
+
     def test_reversal_flattened_harmony_final_still_requires_exact_verdict(self):
         from src.LLMexplaneability.huggingface import HuggingFaceLLM
         forward = delta(added=[[8, 9]])
@@ -431,7 +467,7 @@ class TwoPassIntegration(unittest.TestCase):
                 output, errors = execute(ScriptedLLM(context, llm('judge')), dumps, options, context,
                                          list(options['probes']), Path(root) / 'results')
                 self.assertTrue(errors)
-                self.assertEqual(json.loads((output / 'manifest.json').read_text())['protocol_version'], 3)
+                self.assertEqual(json.loads((output / 'manifest.json').read_text())['protocol_version'], 4)
                 for name in options['probes']:
                     path = next((output / name / 'ctx-off_mode-dict').glob('*.json'))
                     result = json.loads(path.read_text())['counterfactuals'][0]
@@ -527,6 +563,123 @@ class TwoPassIntegration(unittest.TestCase):
             saved['generator'] = llm('judge')
             with self.assertRaises(ValueError):
                 run_saved('reversal', ScriptedLLM(context, llm('judge')), saved)
+
+
+class ModelMatrixIntegration(unittest.TestCase):
+    def prepare_fixture(self, root, samples=5):
+        from scripts import paper_probe_matrix as matrix
+        context, _, dumps, _, _ = integrated_run(Path(root) / 'fixture', samples=samples)
+        config = json.loads((ROOT / matrix.DEFAULT_CONFIG).read_text())
+        # The shared integration fixture uses 16 nodes; production requires 10.
+        config['num_nodes'] = 16
+        path = Path(root) / 'matrix-config.json'
+        path.write_text(json.dumps(config))
+        with patch.object(matrix.subprocess, 'check_output', return_value='0' * 40 + '\n'):
+            run = matrix.prepare(path, Path(root) / 'fixture/output', Path(root) / 'matrix')
+        for path in (run / 'configs').glob('*.json'):
+            settings = json.loads(path.read_text())
+            settings.pop('compose_strs')
+            settings['store_paths'] = context.conf['store_paths']
+            path.write_text(json.dumps(settings))
+        return matrix, config, run, context, dumps
+
+    def test_all_models_replay_same_pairs_and_each_judge_loads_once(self):
+        with tempfile.TemporaryDirectory(prefix='gretel-matrix-') as root:
+            matrix, config, run, context, originals = self.prepare_fixture(root)
+            generator_models = {entry['parameters']['model'] for entry in config['generators']}
+            loaded = []
+            factory = get_instance_kvargs
+            def scripted_model(class_name, kwargs):
+                if class_name != 'src.LLMexplaneability.huggingface.HuggingFaceLLM':
+                    return factory(class_name, kwargs)
+                model = kwargs['local_config']['parameters']['model']
+                role = 'generator' if model in generator_models else 'judge'
+                loaded.append((role, model))
+                return ScriptedLLM(kwargs['context'], {'class': 'probes_fixtures.ScriptedLLM',
+                    'parameters': {'role': role, 'model': model}})
+            with patch('src.core.factory_base.get_instance_kvargs', side_effect=scripted_model):
+                for entry in config['generators']:
+                    Context._Context__global = None
+                    matrix.run_generator(run, entry['id'])
+                for entry in config['judges']:
+                    Context._Context__global = None
+                    self.assertEqual(matrix.run_judge(run, entry['id']), 0)
+            self.assertEqual(len(loaded), 9)
+            self.assertEqual(sum(role == 'judge' for role, _ in loaded), 3)
+            rows, cells = matrix.collect(run)
+            self.assertEqual(len(cells), 18)
+            self.assertTrue(all(cell['status'] == 'complete' for cell in cells))
+            self.assertEqual(len(rows), 54)
+            self.assertTrue(all(row['n'] == 5 and row['n_success'] == 5 for row in rows))
+            for entry in config['generators']:
+                from scripts.run_paper_probes import load_dumps
+                generated = load_dumps(run / 'generated' / entry['id'])
+                sources = {payload['id']: payload['data'] for _, payload, _ in originals}
+                self.assertEqual(len(generated), 5)
+                for _, payload, _ in generated:
+                    old, new = sources[payload['id']], payload['data']
+                    self.assertEqual(new['generator']['parameters']['model'], entry['parameters']['model'])
+                    for before, after in zip(old['counterfactuals'], new['counterfactuals']):
+                        for field in ('input', 'counterfactual', 'truth', 'input_label', 'target_label'):
+                            self.assertEqual(after[field], before[field])
+                        for direction in ('direct', 'inverse'):
+                            self.assertEqual(after[direction + '_generation']['judge_request'],
+                                             before[direction + '_generation']['judge_request'])
+
+    def test_regeneration_retains_bad_answers_and_preserves_original_dump(self):
+        from src.utils.probe_generation import regenerate_saved
+        with tempfile.TemporaryDirectory(prefix='gretel-regenerate-') as root:
+            context, _, dumps, _, _ = integrated_run(root, samples=1)
+            source = dumps[0][1]['data']
+            before = copy.deepcopy(source)
+            model = Replies(source['counterfactuals'][0]['direct_output'], '{}')
+            model.local_config = llm('generator')
+            result = regenerate_saved(model, source, 'scripted-generator')
+            self.assertEqual(source, before)
+            record = result['counterfactuals'][0]
+            self.assertEqual(record['status'], 'partial_error')
+            self.assertEqual(record['direct_generation']['status'], 'success')
+            self.assertEqual(record['inverse_generation']['status'], 'unparsed')
+            self.assertEqual(record['inverse_output'], '{}')
+            self.assertEqual(run_saved('reconstruction', ScriptedLLM(context, llm('judge')), result)[0]['status'], 'success')
+            self.assertEqual(run_saved('reversal', ScriptedLLM(context, llm('judge')), result)[0]['error_origin'], 'generator')
+
+    def test_source_validation_and_cached_judge_failure_are_visible(self):
+        with tempfile.TemporaryDirectory(prefix='gretel-matrix-errors-') as root:
+            matrix, config, run, context, dumps = self.prepare_fixture(root)
+            with self.assertRaises(ValueError):
+                matrix.validate_sources(dumps, {**config, 'num_nodes': 10})
+            with self.assertRaises(ValueError):
+                matrix.validate_sources(dumps + [dumps[0]], config)
+            Context._Context__global = None
+            with patch('src.core.factory_base.get_instance_kvargs', side_effect=FileNotFoundError('Missing cached checkpoint')):
+                self.assertEqual(matrix.run_judge(run, config['judges'][0]['id']), 2)
+            _, cells = matrix.collect(run)
+            self.assertEqual(sum(cell['status'] == 'error' for cell in cells), 6)
+            frozen = Path(json.loads((run / 'matrix.json').read_text())['sources'][0]['frozen'])
+            frozen.write_text(frozen.read_text() + '\n')
+            with self.assertRaisesRegex(ValueError, 'Frozen source'):
+                matrix.frozen_dumps(run)
+
+    def test_slurm_chain_records_ids_and_continues_after_failed_jobs(self):
+        from scripts import paper_probe_matrix as matrix
+        with tempfile.TemporaryDirectory(prefix='gretel-slurm-matrix-') as root:
+            run = Path(root)
+            config = json.loads((ROOT / matrix.DEFAULT_CONFIG).read_text())
+            matrix.write_json(run / 'matrix.json', {'configuration': config})
+            ids = [str(541300 + i) for i in range(9)]
+            with patch.object(matrix.subprocess, 'run', side_effect=[types.SimpleNamespace(stdout=i + '\n') for i in ids]) as sbatch:
+                matrix.submit(run)
+                calls = [args.args[0] for args in sbatch.call_args_list]
+            self.assertEqual(len(calls), 9)
+            self.assertFalse(any(arg.startswith('--dependency') for arg in calls[0]))
+            for previous, command in zip(ids, calls[1:]):
+                self.assertIn('--dependency=afterany:' + previous, command)
+            self.assertEqual([command[-3] for command in calls], ['matrix-generator'] * 6 + ['matrix-judge'] * 3)
+            ledger = [json.loads(line) for line in (run / 'jobs.jsonl').read_text().splitlines()]
+            self.assertEqual([row['job_id'] for row in ledger], ids)
+            with self.assertRaises(ValueError):
+                matrix.submit(run)
 
 
 if __name__ == '__main__':
