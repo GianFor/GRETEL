@@ -9,8 +9,7 @@ The starting points are the branch's thesis-based Reconstruction,
 Alejandra's `llm_explanation_contrastive_explanation` and `FlipRateEvaluator`,
 and Rodrigo's proposed inverse-edit comparison and no-explanation control.
 Upstream stages, evaluator, factories, explainer and oracle implementations
-are used without modification. The existing `run_probes.py` remains the
-legacy Reconstruction runner; `run_paper_probes.py` reads the new complete
+are used without modification. `run_paper_probes.py` reads the complete
 first-pass records.
 
 ## Two passes
@@ -127,7 +126,10 @@ are canonical; directed edges retain orientation and addition/removal is part
 of edit identity. Feature reuse means the same node, feature column and numeric
 from/to transition, resolving names and column indices to the same column.
 A different transition on that column is a different edit. Reused edits and
-the rejection phase (`proposal` or `realized`) are saved. `success: target`
+the rejection phase (`proposal` or `realized`) are saved. A reuse has its own
+status, `reused_original`, kept apart from `invalid_proposal`; it counts as an
+unsuccessful attempt, and each arm's summary reports `<arm>_n_reused_original`.
+`success: target`
 requires the saved counterfactual class; `flip` accepts any changed class.
 Both flags are retained in output. The prompt requests minimality and domain
 compliance; a successful flip alone certifies neither minimality, domain

@@ -15,7 +15,7 @@ If any criterion is not met or information is insufficient, answer NO.
 Do not explain or justify. Output exactly one word: YES or NO.'''
 
 
-def run(judge, items, use_context=False, mode='full', feature_match='identity', require_structured=False):
+def run(judge, items, use_context=False, mode='dict', feature_match='transition', require_structured=False):
     """Items: direct raw, inverse raw, factual text, inverse factual text, directed.
 
     This probe reads no true delta and invokes extraction independently, even
@@ -23,8 +23,8 @@ def run(judge, items, use_context=False, mode='full', feature_match='identity', 
     """
     forward_items = [(a, ga, None, d) for a, b, ga, gb, d in items]
     backward_items = [(b, gb, None, d) for a, b, ga, gb, d in items]
-    forward = reconstruction_probe.run(judge, forward_items, use_context, mode, True, feature_match, require_structured)
-    backward = reconstruction_probe.run(judge, backward_items, use_context, mode, True, feature_match, require_structured)
+    forward = reconstruction_probe.run(judge, forward_items, use_context, mode, feature_match, require_structured)
+    backward = reconstruction_probe.run(judge, backward_items, use_context, mode, feature_match, require_structured)
     records, prompts, pending = [], [], []
     for i, (a, b, ga, gb, directed) in enumerate(items):
         record = {'status': 'partial_error', 'forward': forward[i], 'backward': backward[i],

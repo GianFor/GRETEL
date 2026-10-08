@@ -354,6 +354,7 @@ def collect(run):
     columns = ['generator', 'judge', 'probe', 'condition', 'n', 'n_success', 'status_counts',
                'edges_f1_valid_mean', 'n_semantic_valid', 'semantic_yes_count',
                'with_explanation_success_rate_all_attempts', 'without_explanation_success_rate_all_attempts',
+               'with_explanation_n_reused_original', 'without_explanation_n_reused_original',
                'success_rate_difference_all_attempts', 'result']
     with (run / 'matrix-summary.csv').open('w', newline='') as stream:
         writer = csv.DictWriter(stream, fieldnames=columns, extrasaction='ignore')

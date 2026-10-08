@@ -1,5 +1,5 @@
 #!/bin/bash -l
-# Same assigned-GPU waiting policy as slurm_probes.sh; paper runner is explicit.
+# Waits for free memory on the Slurm-assigned GPU, then runs one probe pass.
 #SBATCH -J paper-probes
 #SBATCH -p cuda
 #SBATCH --gres=gpu:fast:1

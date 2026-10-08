@@ -56,19 +56,6 @@ def test_feature_changes_match_on_node_and_name_only():
     assert _m.score_delta(truth, pred)['features_changed']['f1'] == 0.0
 
 
-def test_parse_extraction_accepts_fences_and_string_edges():
-    text = 'Here it is:\n```json\n{"edges_removed": ["3 -- 7", [1, 2]], "features_changed": ["4:charge"]}\n```'
-    delta = _m.parse_extraction(text)
-    assert delta == {'edges_added': [], 'edges_removed': [[3, 7], [1, 2]],
-                     'features_changed': [{'node': 4, 'feature': 'charge'}]}
-
-
-def test_parse_extraction_rejects_non_json():
-    assert _m.parse_extraction('no delta here') is None
-    assert _m.parse_extraction('') is None
-    assert _m.parse_extraction('[1, 2]') is None
-
-
 if __name__ == '__main__':
     tests = [obj for name, obj in sorted(globals().items()) if name.startswith('test_')]
     for test in tests:

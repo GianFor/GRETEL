@@ -132,7 +132,7 @@
       "feature_match": "transition",
       "conditions": [
         {
-          "context": "off",
+          "context": "on",
           "mode": "dict"
         }
       ]
@@ -141,7 +141,7 @@
       "feature_match": "transition",
       "conditions": [
         {
-          "context": "off",
+          "context": "on",
           "mode": "dict"
         }
       ]

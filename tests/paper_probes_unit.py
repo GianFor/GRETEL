@@ -131,7 +131,7 @@ class GeneralContracts(unittest.TestCase):
         truth = delta(added=[[0, 1]], features=[{'node': 0, 'feature': 'x', 'from': 0, 'to': 1}])
         predicted = delta(added=[[1, 0]], features=[{'node': 0, 'feature': 'x', 'from': 1, 'to': 0}])
         r = reconstruction_probe.run(Replies(json.dumps(predicted)), [(answer(truth), '', truth, True)],
-                                     False, 'dict', True, 'transition', True)[0]
+                                     False, 'dict', 'transition', True)[0]
         self.assertEqual(r['status'], 'success')
         self.assertEqual(r['scores']['edges']['f1'], 0)
         self.assertEqual(r['scores']['features_changed']['f1'], 0)
@@ -289,7 +289,7 @@ class GeneralContracts(unittest.TestCase):
             text=text, finish_reason=reason, stop_reason=None, token_ids=[1, 2, 3])])
         judge.llm = types.SimpleNamespace(chat=lambda *a, **k: [completion(raw, 'stop'), completion(unfinished, 'length')])
         records = reconstruction_probe.run(judge, [(answer(edit), '', edit, False)] * 2,
-            use_context=False, mode='dict', strict=True, feature_match='transition', require_structured=True)
+            use_context=False, mode='dict', feature_match='transition', require_structured=True)
         self.assertEqual(records[0]['status'], 'success')
         self.assertEqual(records[0]['judge_output'], final)
         self.assertEqual(records[0]['judge_raw_output'], raw)
@@ -302,7 +302,7 @@ class GeneralContracts(unittest.TestCase):
         self.assertEqual(records[1]['output_token_count'], 3)
         json.loads(json.dumps(records))  # Diagnostics remain ordinary saved JSON.
         unknown = reconstruction_probe.run(Replies(json.dumps({**edit, 'size': {}})),
-            [(answer(edit), '', edit, False)], use_context=False, mode='dict', strict=True)[0]
+            [(answer(edit), '', edit, False)], use_context=False, mode='dict')[0]
         self.assertEqual(unknown['error'], 'Unknown delta fields')
         self.assertEqual(HuggingFaceLLM._clean('Analysis of edits'), 'Analysis of edits')
         copied = copy.deepcopy(judge.explain_counterfactual('system', 'prompt'))
@@ -372,9 +372,9 @@ class GeneralContracts(unittest.TestCase):
         truth = delta(added=[[0, 2]])
         item = dict(instance=g, output=answer(truth), truth=truth, input_label=0, target_label=1,
                     graph_text='graph', modifications_text='edits', domain='domain', feature_map={})
-        for edit in (delta(), truth, delta(added=[[0, 20]])):
+        for edit, status in ((delta(), 'invalid_proposal'), (truth, 'reused_original'), (delta(added=[[0, 20]]), 'invalid_proposal')):
             r = recourse_probe.run(Replies(json.dumps(edit)), [item], lambda graph: 0, mode='dict', control=False, require_structured=True)[0]
-            self.assertEqual(r['with_explanation']['status'], 'invalid_proposal')
+            self.assertEqual(r['with_explanation']['status'], status)
         r = recourse_probe.run(Replies(json.dumps(delta(removed=[[0, 1]]))), [item], lambda graph: 0,
                                mode='dict', control=False, require_structured=True)[0]
         self.assertEqual(r['status'], 'success')
@@ -397,10 +397,15 @@ class GeneralContracts(unittest.TestCase):
             r = recourse_probe.run(Replies(json.dumps(proposal), json.dumps(proposal)), [item], predictor,
                                    mode='dict', require_structured=True)[0]
             for arm in ('with_explanation', 'without_explanation'):
-                self.assertEqual(r[arm]['status'], 'invalid_proposal')
+                self.assertEqual(r[arm]['status'], 'reused_original')
                 self.assertEqual(r[arm]['reused_edits'], {'edges_added': [[0, 1]]})
                 self.assertEqual(r[arm]['reuse_phase'], 'proposal')
             self.assertEqual(len(calls), 1)  # Factual replay only, no invalid-candidate predictions.
+            summary = summarize('recourse', [r])
+            self.assertEqual(summary['with_explanation_n_reused_original'], 1)
+            self.assertEqual(summary['without_explanation_n_reused_original'], 1)
+            self.assertEqual(summary['with_explanation_n_valid'], 0)
+            self.assertEqual(summary['with_explanation_success_rate_all_attempts'], 0)
 
     def test_recourse_reuse_respects_orientation_and_feature_aliases(self):
         g = GraphInstance(1, 0, np.array([[0, 1], [0, 0]]), directed=True)
@@ -410,7 +415,7 @@ class GeneralContracts(unittest.TestCase):
         proposal = delta(features=[{'node': 0, 'feature': 0, 'from': 0, 'to': 1}])
         r = recourse_probe.run(Replies(json.dumps(proposal)), [item], lambda graph: 0,
                                mode='dict', control=False, require_structured=True)[0]
-        self.assertEqual(r['with_explanation']['status'], 'invalid_proposal')
+        self.assertEqual(r['with_explanation']['status'], 'reused_original')
         self.assertIn('features_changed', r['with_explanation']['reused_edits'])
         # Another transition on that column, and the opposite directed edge, are new edits.
         proposal = delta(added=[[1, 0]], features=[{'node': 0, 'feature': 0, 'from': 0, 'to': 2}])
@@ -431,7 +436,7 @@ class GeneralContracts(unittest.TestCase):
         r = recourse_probe.run(Replies(json.dumps(delta(added=[[0, 2]]))), [item], lambda graph: 0,
                                mode='dict', control=False, require_structured=True, preprocess=preprocess)[0]
         arm = r['with_explanation']
-        self.assertEqual(arm['status'], 'invalid_proposal')
+        self.assertEqual(arm['status'], 'reused_original')
         self.assertEqual(arm['reuse_phase'], 'realized')
         self.assertEqual(arm['reused_edits'], {'edges_added': [[0, 1]]})
         self.assertEqual(arm['realized_edits']['edges_added'], [[0, 1], [0, 2]])
@@ -449,7 +454,7 @@ class GeneralContracts(unittest.TestCase):
         truth = delta(added=[[0, 2]])
         records = reconstruction_probe.run(Replies(None, '{}', json.dumps(delta())),
                                            [(answer(truth), '', truth, False)] * 3,
-                                           False, 'dict', True, 'transition', True)
+                                           False, 'dict', 'transition', True)
         self.assertEqual([r['status'] for r in records], ['model_error', 'judge_unparsed', 'success'])
         self.assertEqual(records[2]['scores']['edges']['f1'], 0)
 

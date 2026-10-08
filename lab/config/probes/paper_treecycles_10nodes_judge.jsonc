@@ -12,8 +12,8 @@
     }
   },
   "probes": {
-    "reconstruction": {"feature_match": "transition", "conditions": [{"context": "off", "mode": "dict"}]},
-    "reversal": {"feature_match": "transition", "conditions": [{"context": "off", "mode": "dict"}]},
+    "reconstruction": {"feature_match": "transition", "conditions": [{"context": "on", "mode": "dict"}]},
+    "reversal": {"feature_match": "transition", "conditions": [{"context": "on", "mode": "dict"}]},
     "recourse": {"control": true, "success": "target", "preprocess": true, "conditions": [{"context": "off", "mode": "dict"}]}
   }
 }

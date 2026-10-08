@@ -9,6 +9,10 @@ from src.utils.probe_graph import apply_edits, snapshot, unsupported_changes
 from src.utils.typed_delta import typed_delta_from_instances
 
 
+class ReusedOriginalEdits(ValueError):
+    """The proposal shares an elementary edit with the original counterfactual."""
+
+
 def build_prompt(graph_text, modifications_text, domain, narrative, target_label):
     from src.LLMexplaneability.flip_rate_evaluation import FlipRateEvaluator
     original = FlipRateEvaluator(graph_text.rstrip() + '\n', modifications_text.rstrip() + '\n', domain.rstrip() + '\n',
@@ -100,7 +104,7 @@ def run(judge, items, predictor, mode='full', control=True, require_structured=F
                     reused = _reused_edits(edits, item['truth'], item['instance'].directed, item.get('feature_map'))
                     if reused:
                         answer.update(reused_edits=reused, reuse_phase='proposal')
-                        raise ValueError('Proposal reuses original edits')
+                        raise ReusedOriginalEdits('Proposal reuses original edits')
                     candidate = apply_edits(item['instance'], edits, item.get('feature_map'), edge_defaults)
                     if preprocess is not None:
                         try:
@@ -120,9 +124,11 @@ def run(judge, items, predictor, mode='full', control=True, require_structured=F
                     reused = _reused_edits(realized, item['truth'], item['instance'].directed, feature_map)
                     if reused:
                         answer.update(reused_edits=reused, reuse_phase='realized')
-                        raise ValueError('Proposal reuses original edits after preprocessing')
+                        raise ReusedOriginalEdits('Proposal reuses original edits after preprocessing')
                 except NotImplementedError as exc:
                     answer.update(status='unsupported_edits', error=str(exc))
+                except ReusedOriginalEdits as exc:
+                    answer.update(status='reused_original', successful=False, error=str(exc))
                 except (ValueError, IndexError, TypeError) as exc:
                     answer.update(status='invalid_proposal', error=str(exc))
                 else:

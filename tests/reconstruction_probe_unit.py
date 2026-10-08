@@ -29,8 +29,11 @@ _load('probe_common.py', 'src.utils.probe_common')
 _load('reconstruction_metrics.py', 'src.utils.reconstruction_metrics')
 probe = _load('reconstruction_probe.py', 'src.utils.reconstruction_probe')
 
-TWO_PART = 'Edits:\n```json\n{"edges_removed": [[1, 2]], "narrative": "Node 1 was disconnected from node 2."}\n```\nDone.'
+TWO_PART = ('Edits:\n```json\n{"edits": {"edges_added": [], "edges_removed": [[1, 2]], "features_changed": []}, '
+            '"Natural_Language_Explanation": "Node 1 was disconnected from node 2."}\n```\nDone.')
 TRUTH = {'edges_added': [], 'edges_removed': [[1, 2]], 'features_changed': []}
+EXTRACTED = '{"edges_added": [], "edges_removed": [[1, 2]], "features_changed": []}'
+
 
 
 class EchoJudge:
@@ -43,14 +46,8 @@ class EchoJudge:
         return [self.answer] * len(pairs)
 
 
-def test_narrative_field_reads_two_part_output():
-    assert probe.narrative_field(TWO_PART) == 'Node 1 was disconnected from node 2.'
-    assert probe.narrative_field('plain prose without a block') is None
-    assert probe.narrative_field('```json\n{"edges_removed": []}\n```') is None
-
-
 def test_mode_dict_skips_outputs_without_narrative():
-    judge = EchoJudge('{"edges_removed": [[1, 2]]}')
+    judge = EchoJudge(EXTRACTED)
     records = probe.run(judge, [('plain prose', 'G', TRUTH, False), (TWO_PART, 'G', TRUTH, False)],
                         use_context=False, mode='dict')
     assert records[0]['status'] == 'unparsed'
@@ -61,10 +58,10 @@ def test_mode_dict_skips_outputs_without_narrative():
 
 
 def test_context_on_adds_graph_and_full_mode_uses_raw_output():
-    judge = EchoJudge('{"edges_removed": [[2, 1]]}')
+    judge = EchoJudge(EXTRACTED.replace('[1, 2]', '[2, 1]'))
     records = probe.run(judge, [(TWO_PART, 'Edges: {(1 -- 2)}', TRUTH, False)], use_context=True, mode='full')
     system, prompt = judge.prompts[0]
-    assert system == probe.JUDGE_SYSTEM_PROMPT
+    assert system.startswith(probe.JUDGE_SYSTEM_PROMPT)
     assert 'FACTUAL GRAPH' in prompt and 'Edges: {(1 -- 2)}' in prompt
     assert TWO_PART.strip() in prompt
     assert records[0]['scores']['edges']['f1'] == 1.0

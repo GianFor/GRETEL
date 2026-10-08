@@ -79,7 +79,7 @@ def run_saved(name, judge, saved, context='off', mode='dict', feature_match='tra
         items.append(inputs)
         pending.append(index)
     if name == 'reconstruction':
-        evaluated = reconstruction_probe.run(judge, items, context == 'on', mode, True, feature_match, True)
+        evaluated = reconstruction_probe.run(judge, items, context == 'on', mode, feature_match, True)
     elif name == 'reversal':
         evaluated = reversal_probe.run(judge, items, context == 'on', mode, feature_match, True)
     else:
@@ -128,6 +128,7 @@ def summarize(name, records):
             valid = result[arm + '_n_valid']
             result[arm + '_success_rate_valid'] = result[arm + '_n_successful'] / valid if valid else None
             result[arm + '_status_counts'] = counts(attempts)['status_counts']
+            result[arm + '_n_reused_original'] = sum(r['status'] == 'reused_original' for r in attempts)
         if 'without_explanation_success_rate_all_attempts' in result and n:
             result['success_rate_difference_all_attempts'] = (result['with_explanation_success_rate_all_attempts']
                                                               - result['without_explanation_success_rate_all_attempts'])
