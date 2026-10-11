@@ -18,6 +18,13 @@ export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export VECLIB_MAXIMUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
+# Thread pools that otherwise size themselves on the whole node: HF tokenizers
+# (Rayon) and the torch.compile workers that vLLM starts. srun does not inherit
+# -c from sbatch (Slurm >= 22.05), so pass it to the job step explicitly.
+export RAYON_NUM_THREADS=$OMP_NUM_THREADS
+export TOKENIZERS_PARALLELISM=false
+export TORCHINDUCTOR_COMPILE_THREADS=1
+export SRUN_CPUS_PER_TASK=$OMP_NUM_THREADS
 export HF_HOME=${HF_HOME:-$HOME/hf_cache}
 export PYTHONUNBUFFERED=1
 export VLLM_WORKER_MULTIPROC_METHOD=${VLLM_WORKER_MULTIPROC_METHOD:-spawn}
