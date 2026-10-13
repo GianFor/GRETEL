@@ -65,6 +65,9 @@ def read_object(text, allow_literal=False):
 
 
 def node_index(value):
+    # JSON-quoted indices ("22") name the same node; any other string is rejected.
+    if type(value) is str and re.fullmatch('[0-9]+', value):
+        value = int(value)
     if type(value) is not int or value < 0:
         raise ValueError('Node indices must be nonnegative integers')
     return value
@@ -219,6 +222,10 @@ def saved_generation_outcomes(item):
             answer = {'status': 'model_error', 'error': 'Invalid saved generation outcome'}
         else:
             answer = dict(saved)
+            # Validity is re-derived from the saved text with the current parser.
+            if answer.get('call_status') == 'success':
+                answer['status'] = 'success'
+                answer.pop('error', None)
         answer['judge_output'] = item.get(direction + '_output')
         result = generation_outcome(answer, directed)
         outcomes[direction] = {key: result[key] for key in ('status', 'call_status', 'error') if key in result}

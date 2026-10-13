@@ -6,7 +6,7 @@ from src.utils.probe_graph import restore
 from src.utils.probe_common import counts, check_judge, saved_generation_outcomes, validate_delta
 
 NARRATIVES_STAGE = 'src.evaluation.future.stages.probe_narratives.ProbeNarratives'
-PROBE_PROTOCOL_VERSION = 5  # Preserve raw answers; Recourse prompts contain only typed edits.
+PROBE_PROTOCOL_VERSION = 6  # Quoted node indices ("22") parse as integers.
 
 
 def run_saved(name, judge, saved, context='off', mode='dict', feature_match='transition',

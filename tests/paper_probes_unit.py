@@ -45,7 +45,7 @@ from src.future.explanation.local.graph_counterfactual import LocalGraphCounterf
 from src.oracle.oracle_factory import OracleFactory
 from src.utils.context import Context
 from src.utils.logger import GLogger
-from src.utils.probe_common import call_many, inverse_delta, read_object, select_text, validate_delta
+from src.utils.probe_common import call_many, inverse_delta, read_object, saved_generation_outcomes, select_text, validate_delta
 from src.utils.probe_graph import apply_edits, restore, snapshot
 from src.utils.probe_inputs import NARRATIVES_STAGE, run_saved, summarize
 from src.utils import reconstruction_probe, reversal_probe, recourse_probe
@@ -106,6 +106,26 @@ class GeneralContracts(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 validate_delta(value, feature_match='transition')
         self.assertFalse(any(validate_delta(delta()).values()))
+
+    def test_quoted_node_indices_are_the_same_nodes(self):
+        parsed = validate_delta(delta(removed=[['22', '23']], features=[{'node': '0', 'feature': 'x', 'from': 0, 'to': 1}]))
+        self.assertEqual(parsed['edges_removed'], [[22, 23]])
+        self.assertEqual(parsed['features_changed'][0]['node'], 0)
+        for index in ('node 5', '5.0', ' 5', '-1', '', '\u0665', '+5'):
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                validate_delta(delta(added=[[index, 1]]))
+        with self.assertRaises(ValueError):
+            validate_delta(delta(added=[['1', 2], [1, '2']]))
+
+    def test_saved_generation_validity_follows_the_current_parser(self):
+        g = GraphInstance(1, 0, np.zeros((3, 3)))
+        item = {'input_status': 'success', 'input': snapshot(g),
+                'direct_output': answer(delta(removed=[['1', '2']])), 'inverse_output': None,
+                'direct_generation': {'status': 'unparsed', 'call_status': 'success', 'error': 'old parser'},
+                'inverse_generation': {'status': 'model_error', 'call_status': 'model_error', 'error': 'timeout'}}
+        outcomes = saved_generation_outcomes(item)
+        self.assertEqual(outcomes['direct'], {'status': 'success', 'call_status': 'success'})
+        self.assertEqual(outcomes['inverse']['status'], 'model_error')
 
     def test_duplicate_json_fields_are_rejected(self):
         with self.assertRaises(ValueError):
@@ -526,7 +546,7 @@ class TwoPassIntegration(unittest.TestCase):
                 output, errors = execute(ScriptedLLM(context, llm('judge')), dumps, options, context,
                                          list(options['probes']), Path(root) / 'results')
                 self.assertTrue(errors)
-                self.assertEqual(json.loads((output / 'manifest.json').read_text())['protocol_version'], 5)
+                self.assertEqual(json.loads((output / 'manifest.json').read_text())['protocol_version'], 6)
                 for name in options['probes']:
                     path = next((output / name / 'ctx-off_mode-dict').glob('*.json'))
                     result = json.loads(path.read_text())['counterfactuals'][0]

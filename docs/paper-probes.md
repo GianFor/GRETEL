@@ -62,7 +62,8 @@ The parser accepts JSON or a single JSON fence. Generator answers may also
 use Python dictionary literals as in the thesis, including the legacy
 `narrative` field; judge deltas must be JSON. Duplicate fields, multiple
 fences, malformed edits, negative/fractional/bool node IDs, conflicting edits
-and nonfinite values are errors. A valid empty delta has explicit empty
+and nonfinite values are errors. A node ID written as a JSON string of ASCII
+digits (`"22"`) is the integer node 22; any other string is an error. A valid empty delta has explicit empty
 lists; `{}` is not a valid extraction. Empty node-change lists can be omitted
 by judges, while the three original edge/feature lists are required.
 
@@ -168,8 +169,10 @@ generation failures with `error_origin: generator` and the failed directions.
 Reconstruction/Recourse require only a valid direct answer; a failed inverse
 does not block them. Reversal requires both answers. Older schema-1 dumps remain
 readable: outcomes are derived from saved backend metadata and actual responses.
+When the saved call succeeded, answer validity is re-derived from the saved
+response with the current parser, so parser changes need no regeneration.
 Summaries include generation status counts per direction. Offline manifests
-include probe `protocol_version: 5` so corrected judge decoding results do not
+include probe `protocol_version: 6` so results under a changed parser do not
 overwrite results from the earlier protocol under the same run identity.
 
 Summaries expose total counts, status counts, number scored, means over valid
