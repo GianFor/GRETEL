@@ -358,6 +358,25 @@ records and their effective configurations are under
 `lab/output/logs/slurm_JOB_ID.out`. Each judge refreshes the aggregate summary;
 the `summary` command can rebuild it at any time.
 
+## BBBP pilot with OFS
+
+`lab/config/probes/paper_bbbp_ofs_generate.jsonc` is the first real-data pilot.
+OFS edits the bonds of the molecule itself and LocalSearch (without attributes)
+minimizes them, so the counterfactual keeps the original atoms and no padding
+is needed. The GCN oracle of the `BBBP_GCN` do-pair reads node features,
+structure and edge weights, never the RDKit bond features; the
+`DropEdgeFeatures` manipulator removes them, so the explained graph is the one
+the oracle uses and the explainers' candidates (built without edge features)
+are not reported as unsupported edge changes. Forty stratified splits without
+shuffling leave about 51 molecules in fold 0; the oracle trains on the other
+folds, and its logged test accuracy is on the explained molecules.
+
+```bash
+mkdir -p lab/output/logs
+gen_job=$(sbatch --parsable --job-name=probes-bbbp-gen scripts/slurm_paper_probes.sh generate lab/config/probes/paper_bbbp_ofs_generate.jsonc)
+sbatch --job-name=probes-bbbp-judge --dependency="afterok:${gen_job%%;*}" --export=ALL,SAMPLE_LIMIT=60 scripts/slurm_paper_probes.sh probe lab/config/probes/paper_bbbp_ofs_judge.jsonc lab/output/results/paper-probes-bbbp-ofs
+```
+
 ## Reuse narratives for a judge rerun
 
 After a judge decoding or prompt correction, use a fresh run directory:

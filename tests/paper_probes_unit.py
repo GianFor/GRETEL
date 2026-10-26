@@ -46,7 +46,7 @@ from src.oracle.oracle_factory import OracleFactory
 from src.utils.context import Context
 from src.utils.logger import GLogger
 from src.utils.probe_common import call_many, inverse_delta, read_object, saved_generation_outcomes, select_text, validate_delta
-from src.utils.probe_graph import apply_edits, restore, snapshot
+from src.utils.probe_graph import apply_edits, restore, snapshot, unsupported_changes
 from src.utils.probe_inputs import NARRATIVES_STAGE, run_saved, summarize
 from src.utils import reconstruction_probe, reversal_probe, recourse_probe
 
@@ -126,6 +126,19 @@ class GeneralContracts(unittest.TestCase):
         outcomes = saved_generation_outcomes(item)
         self.assertEqual(outcomes['direct'], {'status': 'success', 'call_status': 'success'})
         self.assertEqual(outcomes['inverse']['status'], 'model_error')
+
+    def test_dropped_edge_features_match_explainer_candidates(self):
+        from src.dataset.manipulators.drop_edge_features import DropEdgeFeatures
+        adj = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]], dtype=float)
+        g = GraphInstance(0, 0, adj, edge_features=np.arange(8, dtype=float).reshape(4, 2))
+        dataset = types.SimpleNamespace(instances=[g], edge_features_map={'SINGLE': 0, 'DOUBLE': 1})
+        manipulator = object.__new__(DropEdgeFeatures)
+        manipulator.dataset = dataset
+        manipulator.process()
+        self.assertEqual(dataset.edge_features_map, {})
+        self.assertEqual(g.edge_features.shape, (4, 1))
+        # OFS and LocalSearch build candidates without edge features.
+        self.assertFalse(unsupported_changes(g, GraphInstance(0, 0, adj.copy())))
 
     def test_duplicate_json_fields_are_rejected(self):
         with self.assertRaises(ValueError):
