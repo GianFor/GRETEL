@@ -364,10 +364,14 @@ the `summary` command can rebuild it at any time.
 OFS edits the bonds of the molecule itself and LocalSearch (without attributes)
 minimizes them, so the counterfactual keeps the original atoms and no padding
 is needed. The GCN oracle of the `BBBP_GCN` do-pair reads node features,
-structure and edge weights, never the RDKit bond features; the
-`DropEdgeFeatures` manipulator removes them, so the explained graph is the one
-the oracle uses and the explainers' candidates (built without edge features)
-are not reported as unsupported edge changes. Forty stratified splits without
+structure and edge weights, never the RDKit bond features or the SMILES/RDKit
+object kept as graph features; the `OracleView` manipulator removes them, so
+the explained graph is the one the oracle uses, prompts carry no SMILES, and
+the explainers' candidates (built without them) are not reported as
+unsupported changes. `SeededMolGenerator` seeds the molecule order:
+`MolGenerator` shuffles with the unseeded global random state, while the cache
+keeps only split indices, so each new process would otherwise put different
+molecules in the cached folds. Forty stratified splits without
 shuffling leave about 51 molecules in fold 0; the oracle trains on the other
 folds, and its logged test accuracy is on the explained molecules.
 

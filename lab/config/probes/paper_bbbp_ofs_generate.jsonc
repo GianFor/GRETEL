@@ -1,9 +1,11 @@
 // First real-data pilot: BBBP molecules with the thesis GCN oracle (do-pair
 // BBBP_GCN). OFS edits bonds of the molecule itself, so no padding is needed;
-// LocalSearch without attributes minimizes the bond edits. Edge features are
-// dropped because the GCN never reads them. 40 stratified splits without
-// shuffle: fold 0 holds ~51 held-out molecules, and the oracle is trained on
-// the other 39 folds, so its logged test accuracy is on the explained instances.
+// LocalSearch without attributes minimizes the bond edits. OracleView drops
+// what the GCN never reads (bond features, SMILES/RDKit graph features), and
+// the molecule order is seeded so cached splits and oracle stay valid. 40
+// stratified splits without shuffle: fold 0 holds ~51 held-out molecules, and
+// the oracle is trained on the other 39 folds, so its logged test accuracy is
+// on the explained instances.
 {
   "experiment": {"scope": "paper-probes-bbbp-ofs", "parameters": {"lock_release_tout": 120}},
   "doe-triplets": [
@@ -12,12 +14,12 @@
         "class": "src.dataset.dataset_base.Dataset",
         "parameters": {
           "generator": {
-            "class": "src.dataset.generators.bbbp.BBBP",
-            "parameters": {"data_dir": "data/datasets/bbbp/", "data_file_name": "BBBP.csv", "data_label_name": "p_np"}
+            "class": "src.dataset.generators.mol_seeded.SeededMolGenerator",
+            "parameters": {"data_dir": "data/datasets/bbbp/", "data_file_name": "BBBP.csv", "data_label_name": "p_np", "seed": 0}
           },
           "n_splits": 40,
           "shuffle": false,
-          "manipulators": [{"class": "src.dataset.manipulators.drop_edge_features.DropEdgeFeatures", "parameters": {}}]
+          "manipulators": [{"class": "src.dataset.manipulators.oracle_view.OracleView", "parameters": {}}]
         }
       },
       "oracle": {

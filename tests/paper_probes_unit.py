@@ -8,6 +8,7 @@ Use --demo-output DIR to retain five sample dumps and the offline results.
 """
 import argparse
 import copy
+import importlib.util
 import json
 from pathlib import Path
 import sys
@@ -127,18 +128,41 @@ class GeneralContracts(unittest.TestCase):
         self.assertEqual(outcomes['direct'], {'status': 'success', 'call_status': 'success'})
         self.assertEqual(outcomes['inverse']['status'], 'model_error')
 
-    def test_dropped_edge_features_match_explainer_candidates(self):
-        from src.dataset.manipulators.drop_edge_features import DropEdgeFeatures
+    def test_oracle_view_matches_explainer_candidates(self):
+        from src.dataset.manipulators.oracle_view import OracleView
         adj = np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]], dtype=float)
-        g = GraphInstance(0, 0, adj, edge_features=np.arange(8, dtype=float).reshape(4, 2))
-        dataset = types.SimpleNamespace(instances=[g], edge_features_map={'SINGLE': 0, 'DOUBLE': 1})
-        manipulator = object.__new__(DropEdgeFeatures)
+        g = GraphInstance(0, 0, adj, edge_features=np.arange(8, dtype=float).reshape(4, 2),
+                          graph_features={'smile': 'CCO', 'mol': object()})
+        dataset = types.SimpleNamespace(instances=[g], edge_features_map={'SINGLE': 0, 'DOUBLE': 1},
+                                        graph_features_map={})
+        manipulator = object.__new__(OracleView)
         manipulator.dataset = dataset
         manipulator.process()
         self.assertEqual(dataset.edge_features_map, {})
         self.assertEqual(g.edge_features.shape, (4, 1))
-        # OFS and LocalSearch build candidates without edge features.
+        self.assertIsNone(g.graph_features)
+        json.dumps(snapshot(g))
+        # OFS and LocalSearch build candidates without edge or graph features.
         self.assertFalse(unsupported_changes(g, GraphInstance(0, 0, adj.copy())))
+
+    @unittest.skipUnless(importlib.util.find_spec('rdkit'), 'needs RDKit')
+    def test_seeded_molecules_keep_their_order(self):
+        from src.dataset.generators.mol_gen import rdk_edge_features_map, rdk_node_features_map
+        from src.dataset.generators.mol_seeded import SeededMolGenerator
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / 'molecules.csv'
+            path.write_text('smiles,y\nCCO,1\nc1ccccc1,0\nnot-a-smiles,1\nCC(=O)O,1\nCCN,0\n')
+            orders = []
+            for _ in range(2):
+                dataset = types.SimpleNamespace(instances=[], node_features_map=rdk_node_features_map(),
+                                                edge_features_map=rdk_edge_features_map())
+                generator = object.__new__(SeededMolGenerator)
+                generator.dataset, generator._data_label_name = dataset, 'y'
+                generator.local_config = {'parameters': {'seed': 0}}
+                generator._read(str(path))
+                orders.append([(g.id, g.graph_features['smile'], g.label) for g in dataset.instances])
+        self.assertEqual(orders[0], orders[1])
+        self.assertEqual([i for i, _, _ in orders[0]], [0, 1, 2, 3])
 
     def test_duplicate_json_fields_are_rejected(self):
         with self.assertRaises(ValueError):
