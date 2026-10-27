@@ -48,16 +48,43 @@ def restore(value, dataset=None):
                          graph_features=None if graph_features is None else np.asarray(graph_features), dataset=dataset, **attrs)
 
 
-def graph_text(instance, label, feature_map=None):
+def shown_nodes(instance):
+    """Nodes before the trailing padding: isolated nodes with all-zero features."""
+    data, features = instance.data, instance.node_features
+    n = len(data)
+    while n and not data[n - 1].any() and not data[:, n - 1].any() and not features[n - 1].any():
+        n -= 1
+    return n
+
+
+def touches_hidden(original, counterfactual, shown):
+    """Whether the counterfactual edits a node at or beyond `shown` (hidden padding)."""
+    return bool(counterfactual.data[shown:].any() or counterfactual.data[:, shown:].any()
+                or not np.array_equal(counterfactual.node_features[shown:], original.node_features[shown:]))
+
+
+def delta_nodes(delta):
+    nodes = set(delta.get('nodes_added', [])) | set(delta.get('nodes_removed', []))
+    for key in ('edges_added', 'edges_removed'):
+        nodes.update(node for edge in delta.get(key, []) for node in edge)
+    nodes.update(change['node'] for change in delta.get('features_changed', []))
+    return nodes
+
+
+def graph_text(instance, label, feature_map=None, shown=None):
+    """Prompt text of the graph; `shown` limits it to the leading nodes (hidden padding)."""
     data = instance.data
+    shown = len(data) if shown is None else shown
+    if data[shown:].any() or data[:, shown:].any():
+        raise ValueError('Edges reach nodes beyond the shown ones')
     edges = [[int(u), int(v), float(data[u, v])] for u, v in zip(*np.nonzero(data))
              if instance.directed or u <= v]
-    return (f'Nodes: {list(range(len(data)))}\nDirected: {instance.directed}\n'
+    return (f'Nodes: {list(range(shown))}\nDirected: {instance.directed}\n'
             f'Edges [u,v,value]: {edges}\nFeature columns: {feature_map or {}}\n'
             f'Edge attribute order [u,v]: {[list(map(int, coord)) for coord in zip(*np.nonzero(data))]}\n'
             f'Edge weights: {instance.edge_weights.tolist()}\nEdge features: {instance.edge_features.tolist()}\n'
             f'Graph features: {None if instance.graph_features is None else np.asarray(instance.graph_features).tolist()}\n'
-            f'Node features: {instance.node_features.tolist()}\nOracle predicted class: {label}\n')
+            f'Node features: {instance.node_features[:shown].tolist()}\nOracle predicted class: {label}\n')
 
 
 def edge_attributes(instance):

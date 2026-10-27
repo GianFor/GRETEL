@@ -273,6 +273,36 @@ class GeneralContracts(unittest.TestCase):
                                mode='dict', control=False, require_structured=True, preprocess=preprocess)[0]
         self.assertEqual(r['with_explanation']['status'], 'invalid_proposal')
 
+    def test_padding_nodes_are_hidden_and_edits_on_them_detected(self):
+        from src.utils.probe_graph import graph_text, shown_nodes, touches_hidden
+        adj = np.zeros((5, 5))
+        adj[0, 1] = adj[1, 0] = adj[1, 2] = adj[2, 1] = 1
+        features = np.zeros((5, 2))
+        features[:3] = [[6, 1], [8, 0], [6, 1]]
+        g = GraphInstance(1, 0, adj, node_features=features)
+        self.assertEqual(shown_nodes(g), 3)
+        text = graph_text(g, 0, {'AtomicNum': 0, 'IsAromatic': 1}, 3)
+        self.assertIn('Nodes: [0, 1, 2]\n', text)
+        self.assertIn('Node features: [[6.0, 1.0], [8.0, 0.0], [6.0, 1.0]]\n', text)
+        self.assertFalse(touches_hidden(g, apply_edits(g, delta(removed=[[0, 1]])), 3))
+        padded_edge = apply_edits(g, delta(added=[[2, 3]]))
+        self.assertTrue(touches_hidden(g, padded_edge, 3))
+        with self.assertRaises(ValueError):
+            graph_text(padded_edge, 1, {}, 3)
+
+    def test_recourse_rejects_edits_on_hidden_padding(self):
+        adj = np.zeros((4, 4))
+        adj[0, 1] = adj[1, 0] = adj[1, 2] = adj[2, 1] = 1
+        g = GraphInstance(1, 0, adj)
+        truth = delta(added=[[0, 2]])
+        item = dict(instance=g, output=answer(truth), truth=truth, input_label=0, target_label=1,
+                    graph_text='graph', modifications_text='edits', domain='domain', feature_map={},
+                    shown_nodes=3)
+        r = recourse_probe.run(Replies(json.dumps(delta(added=[[2, 3]]))), [item], lambda graph: 0,
+                               mode='dict', control=False, require_structured=True)[0]
+        self.assertEqual(r['with_explanation']['status'], 'invalid_proposal')
+        self.assertIn('does not show', r['with_explanation']['error'])
+
     def test_backend_final_channel_does_not_mix_in_analysis(self):
         from src.LLMexplaneability.huggingface import HuggingFaceLLM
         text = '<|channel|>analysis<|message|>{"wrong":1}<|end|><|start|>assistant<|channel|>final<|message|>{"right":2}<|return|>'

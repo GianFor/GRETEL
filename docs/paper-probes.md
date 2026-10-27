@@ -381,6 +381,23 @@ gen_job=$(sbatch --parsable --job-name=probes-bbbp-gen scripts/slurm_paper_probe
 sbatch --job-name=probes-bbbp-judge --dependency="afterok:${gen_job%%;*}" --export=ALL,SAMPLE_LIMIT=60 scripts/slurm_paper_probes.sh probe lab/config/probes/paper_bbbp_ofs_judge.jsonc lab/output/results/paper-probes-bbbp-ofs
 ```
 
+## BBBP with the thesis setup and hidden padding
+
+With OFS and the retrained unpadded GCN, 29 of the 39 class-1 molecules of fold
+0 had no counterfactual. `lab/config/probes/paper_bbbp_dce_generate.jsonc`
+follows the thesis setup instead (`bbbp-no-attr/dce/dce-lcls`: padding, DCE,
+LocalSearch editing bonds only) on the same 51 molecules. `ProbeNarratives`
+with `hide_padding: true` shows every prompt only the nodes before the trailing
+padding (isolated nodes with all-zero features). A counterfactual that edits a
+padding node gets status `padding_edit` and is not narrated; a Recourse
+proposal that edits one is an `invalid_proposal`. Generator and judge use a
+16384-token context.
+
+```bash
+gen_job=$(sbatch --parsable --job-name=probes-bbbp-dce-gen scripts/slurm_paper_probes.sh generate lab/config/probes/paper_bbbp_dce_generate.jsonc)
+sbatch --job-name=probes-bbbp-dce-judge --dependency="afterok:${gen_job%%;*}" --export=ALL,SAMPLE_LIMIT=60 scripts/slurm_paper_probes.sh probe lab/config/probes/paper_bbbp_dce_judge.jsonc lab/output/results/paper-probes-bbbp-dce
+```
+
 ## Reuse narratives for a judge rerun
 
 After a judge decoding or prompt correction, use a fresh run directory:

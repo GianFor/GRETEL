@@ -72,7 +72,8 @@ def run_saved(name, judge, saved, context='off', mode='dict', feature_match='tra
                           'target_label': item['target_label'], 'output': item['direct_output'],
                           'graph_text': item['graph_text'], 'modifications_text': 'ORIGINAL EDITS:\n' + json.dumps(truth),
                           'domain': saved['domain'], 'feature_map': saved['feature_map'],
-                          'feature_columns': saved.get('feature_columns'), 'atol': saved.get('atol', 0.0)}
+                          'feature_columns': saved.get('feature_columns'), 'atol': saved.get('atol', 0.0),
+                          'shown_nodes': item.get('shown_nodes')}
         except Exception as exc:
             records[index] = {'status': 'input_error', 'error': f'{type(exc).__name__}: {exc}'}
             continue

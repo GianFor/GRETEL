@@ -22,6 +22,8 @@ class ProbeNarratives(Stage):
         p.setdefault('atol', 0.0)
         p.setdefault('node_matching', 'position')
         p.setdefault('generator_family', None)
+        # Padded datasets: show the LLMs only the nodes before the trailing padding.
+        p.setdefault('hide_padding', False)
         if p['node_matching'] != 'position':
             raise ValueError('A semantic node mapper has not been configured; use explicit positional matching')
 
@@ -44,7 +46,8 @@ class ProbeNarratives(Stage):
             columns = None
         original = explanation.input_instance
         input_label = self._predict(explanation, original)
-        factual_text = probe_graph.graph_text(original, input_label, feature_map)
+        shown = probe_graph.shown_nodes(original) if p['hide_padding'] else None
+        factual_text = probe_graph.graph_text(original, input_label, feature_map, shown)
         records, prompts, owners = [], [], []
         # Do not silently lose failed counterfactual generation from the denominator.
         for cf in explanation.counterfactual_instances or [None]:
@@ -57,8 +60,13 @@ class ProbeNarratives(Stage):
                 continue
             target = self._predict(explanation, cf)
             record.update(input=probe_graph.snapshot(original), counterfactual=probe_graph.snapshot(cf),
-                          input_label=input_label, target_label=target, graph_text=factual_text,
-                          inverse_graph_text=probe_graph.graph_text(cf, target, feature_map))
+                          input_label=input_label, target_label=target, graph_text=factual_text)
+            if shown is not None:
+                record['shown_nodes'] = shown
+                if probe_graph.touches_hidden(original, cf, shown):
+                    record.update(status='padding_edit', error='The counterfactual edits padding nodes, which the prompts do not show')
+                    continue
+            record['inverse_graph_text'] = probe_graph.graph_text(cf, target, feature_map, shown)
             if probe_graph.unsupported_changes(original, cf):
                 record.update(status='unsupported_delta', error='Direction, graph features or existing edge values/attributes changed; TypedDelta does not describe these edits')
                 continue

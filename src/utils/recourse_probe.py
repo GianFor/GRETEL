@@ -5,7 +5,7 @@ aligns it with the other probes; graph application validates edits and preserves
 attributes instead of using the old lossy edit_graph implementation.
 """
 from src.utils.probe_common import DELTA_FIELDS, call_many, read_object, select_text, validate_delta
-from src.utils.probe_graph import apply_edits, snapshot, unsupported_changes
+from src.utils.probe_graph import apply_edits, delta_nodes, snapshot, unsupported_changes
 from src.utils.typed_delta import typed_delta_from_instances
 
 
@@ -105,6 +105,9 @@ def run(judge, items, predictor, mode='full', control=True, require_structured=F
                     if reused:
                         answer.update(reused_edits=reused, reuse_phase='proposal')
                         raise ReusedOriginalEdits('Proposal reuses original edits')
+                    shown = item.get('shown_nodes')
+                    if shown is not None and any(node >= shown for node in delta_nodes(edits)):
+                        raise ValueError('Proposal edits a node the prompt does not show')
                     candidate = apply_edits(item['instance'], edits, item.get('feature_map'), edge_defaults)
                     if preprocess is not None:
                         try:
