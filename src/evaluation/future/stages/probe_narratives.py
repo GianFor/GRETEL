@@ -2,6 +2,8 @@
 import copy
 import json
 
+import numpy as np
+
 from src.core.factory_base import get_instance_kvargs
 from src.evaluation.future.stages.stage import Stage
 from src.LLMexplaneability.prompt_generator import SYSTEM_PROMPT
@@ -9,6 +11,25 @@ from src.utils import probe_graph
 from src.utils.probe_common import OUTPUT_SCHEMA, call_many, generation_outcome, inverse_delta
 from src.utils.typed_delta import typed_delta_from_instances
 from src.utils.context import clean_cfg
+
+
+def seed_outcome(original, cf, seed, feature_columns=None, feature_names=None, atol=0.0):
+    """How the final counterfactual relates to the explainer's seed, when one was kept.
+
+    `minimized` is False when the minimizer returned the seed unchanged; `size`
+    is the edit count of the seed, to compare with the final delta.
+    """
+    if seed is None:
+        return None
+    same = (seed.data.shape == cf.data.shape and np.array_equal(seed.data, cf.data)
+            and np.array_equal(seed.node_features, cf.node_features))
+    outcome = {'minimized': not same}
+    try:
+        outcome['size'] = typed_delta_from_instances(original, seed, feature_columns=feature_columns,
+                                                     feature_names=feature_names, atol=atol)['size']
+    except Exception as exc:
+        outcome['size_error'] = f'{type(exc).__name__}: {exc}'
+    return outcome
 
 
 class ProbeNarratives(Stage):
@@ -48,6 +69,8 @@ class ProbeNarratives(Stage):
         input_label = self._predict(explanation, original)
         shown = probe_graph.shown_nodes(original) if p['hide_padding'] else None
         factual_text = probe_graph.graph_text(original, input_label, feature_map, shown)
+        generated = (explanation.info or {}).get('generator_explanation')
+        seed = generated.counterfactual_instances[0] if generated is not None and generated.counterfactual_instances else None
         records, prompts, owners = [], [], []
         # Do not silently lose failed counterfactual generation from the denominator.
         for cf in explanation.counterfactual_instances or [None]:
@@ -60,7 +83,8 @@ class ProbeNarratives(Stage):
                 continue
             target = self._predict(explanation, cf)
             record.update(input=probe_graph.snapshot(original), counterfactual=probe_graph.snapshot(cf),
-                          input_label=input_label, target_label=target, graph_text=factual_text)
+                          input_label=input_label, target_label=target, graph_text=factual_text,
+                          seed=seed_outcome(original, cf, seed, columns, {v: k for k, v in feature_map.items()}, p['atol']))
             if shown is not None:
                 record['shown_nodes'] = shown
                 if probe_graph.touches_hidden(original, cf, shown):

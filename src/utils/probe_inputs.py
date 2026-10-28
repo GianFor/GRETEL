@@ -88,13 +88,15 @@ def run_saved(name, judge, saved, context='off', mode='dict', feature_match='tra
     if len(evaluated) != len(pending):
         raise RuntimeError('Probe returned a different number of results than inputs')
     for index, result in zip(pending, evaluated):
-        result.update(input_status='success', generation_outcomes=saved_generation_outcomes(source[index]))
+        result.update(input_status='success', generation_outcomes=saved_generation_outcomes(source[index]),
+                      seed=source[index].get('seed'))
         records[index] = result
     # Keep the generation states even when replay or input validation failed.
     for item, record in zip(source, records):
         if isinstance(item, dict):
             record.setdefault('input_status', item.get('input_status', item.get('status')))
             record.setdefault('generation_outcomes', saved_generation_outcomes(item))
+            record.setdefault('seed', item.get('seed'))
     return records
 
 

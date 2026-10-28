@@ -398,6 +398,27 @@ gen_job=$(sbatch --parsable --job-name=probes-bbbp-dce-gen scripts/slurm_paper_p
 sbatch --job-name=probes-bbbp-dce-judge --dependency="afterok:${gen_job%%;*}" --export=ALL,SAMPLE_LIMIT=60 scripts/slurm_paper_probes.sh probe lab/config/probes/paper_bbbp_dce_judge.jsonc lab/output/results/paper-probes-bbbp-dce
 ```
 
+## Seed or minimized counterfactual, and the AIDS pilot
+
+With `GenerateMinimize`, each first-pass record carries `seed`: `minimized` is
+false when the minimizer returned the generator's seed unchanged, and `size`
+counts the seed's edits, to compare with the final delta. Second-pass records
+copy it, so every probe result can be split into minimized counterfactuals and
+returned seeds. On BBBP, LocalSearch without attributes returned the DCE seed
+(another molecule) for 24 of the 36 narrated counterfactuals: no bond edit on
+the original atoms flipped the GCN.
+
+`lab/config/probes/paper_aids_dce_generate.jsonc` applies the BBBP setup to
+AIDS. `FeatureNames` names the 42 node-feature columns as in the TU README
+(`chem`, `charge`, `x`, `y`, then the 38 chemical symbols of the one-hot)
+without changing their values. `dataset_infos/aids.json` now states class 0 as
+active and class 1 as inactive, matching the data (400 and 1600 molecules).
+
+```bash
+gen_job=$(sbatch --parsable --job-name=probes-aids-dce-gen scripts/slurm_paper_probes.sh generate lab/config/probes/paper_aids_dce_generate.jsonc)
+sbatch --job-name=probes-aids-dce-judge --dependency="afterok:${gen_job%%;*}" --export=ALL,SAMPLE_LIMIT=60 scripts/slurm_paper_probes.sh probe lab/config/probes/paper_aids_dce_judge.jsonc lab/output/results/paper-probes-aids-dce
+```
+
 ## Reuse narratives for a judge rerun
 
 After a judge decoding or prompt correction, use a fresh run directory:

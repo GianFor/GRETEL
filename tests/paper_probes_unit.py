@@ -145,6 +145,32 @@ class GeneralContracts(unittest.TestCase):
         # OFS and LocalSearch build candidates without edge or graph features.
         self.assertFalse(unsupported_changes(g, GraphInstance(0, 0, adj.copy())))
 
+    def test_feature_names_rename_columns_only(self):
+        from src.dataset.manipulators.feature_names import FeatureNames
+        features = np.array([[1.0, 0.0, 1.0], [2.0, 1.0, 0.0]])
+        g = GraphInstance(0, 0, np.array([[0, 1], [1, 0]]), node_features=features.copy())
+        dataset = types.SimpleNamespace(instances=[g], node_features_map={'attribute_0': 0, 'attribute_1': 1, 'attribute_2': 2})
+        manipulator = object.__new__(FeatureNames)
+        manipulator.dataset = dataset
+        manipulator.local_config = {'parameters': {'names': ['charge', 'C', 'O']}}
+        manipulator.process()
+        self.assertEqual(dataset.node_features_map, {'charge': 0, 'C': 1, 'O': 2})
+        np.testing.assert_array_equal(g.node_features, features)
+        manipulator.local_config = {'parameters': {'names': ['charge', 'C']}}
+        with self.assertRaises(ValueError):
+            manipulator.process()
+
+    def test_seed_outcome_tells_minimized_from_returned_seed(self):
+        from src.evaluation.future.stages.probe_narratives import seed_outcome
+        g = GraphInstance(0, 0, np.array([[0, 1, 0], [1, 0, 1], [0, 1, 0]]))
+        seed = apply_edits(g, delta(added=[[0, 2]], removed=[[0, 1]]))
+        minimized = apply_edits(g, delta(added=[[0, 2]]))
+        self.assertEqual(seed_outcome(g, minimized, seed)['minimized'], True)
+        returned = seed_outcome(g, seed, seed)
+        self.assertEqual(returned['minimized'], False)
+        self.assertEqual((returned['size']['edges_added'], returned['size']['edges_removed']), (1, 1))
+        self.assertIsNone(seed_outcome(g, minimized, None))
+
     @unittest.skipUnless(importlib.util.find_spec('rdkit'), 'needs RDKit')
     def test_seeded_molecules_keep_their_order(self):
         from src.dataset.generators.mol_gen import rdk_edge_features_map, rdk_node_features_map
