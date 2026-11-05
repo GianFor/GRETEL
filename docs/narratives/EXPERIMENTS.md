@@ -133,3 +133,35 @@ Comparisons across conditions always use the intersection of samples valid in ev
 4. C6, C7, C9, C11 and C12, then E1 and E2 for one narrator end to end.
 5. The full E1 and E2, then E3 to E6.
 6. E7 and E8 offline, and the analyses of section 6.
+
+## 8. Status on 3 November 2026
+
+Step 2 of section 0 is done: Gianrico's #88 and #91 are merged into this branch, #90 went to `main` (#92 brought the general framework fixes of `dev-bls-selector` there too), and #89 was closed because `main` fixed `TreeCyclesRand` and `MolGenerator` in place; the probe configs use them.
+
+Decisions taken:
+
+| # | Decision |
+|---|---|
+| D2 | Tree-Cycles with 500 graphs of 64 nodes, 40 % of the nodes in cycles, rule oracle. |
+| D3 | The current oracles, padding hidden from the prompts (BBBP and AIDS as in Gianrico's DCE pilots). |
+| D4 | DCE seeds, LBS with the LBS paper's parameters. |
+| D8 | Qwen2.5-Instruct 3B, 7B, 14B and 32B and Llama-3.1-8B-Instruct in bf16. Gemini 2.5 Flash waits for API access. |
+| D9 | Until there is API access, GPT-OSS-120B (local) is the only judge and plays the primary role; DeepSeek-V3.2 and Gemini 3 Flash, and with them E5, wait. |
+| D10 | Temperature 0.7, top-p 0.95, 1024 output tokens, seed 0; the identity narrative uses seed 1. |
+| D11 | 100 instances per dataset (fold 0 of 5 splits for Tree-Cycles, of 20 for BBBP and AIDS); Recourse K = the instance's minimized edit count, the same for both arms and for the seed and minimized pairs of an instance; sweep K in 1, 2, 3, 5, 8. |
+
+Still open: D5 (all four CTX x MODE conditions are run, so it only changes which one the tables lead with), D6 (runs use `transition`, as the pilots), D7 (C8 not written). Also open: the Tree-Cycles domain text (`dataset_infos/tcr.json`) states the classification mechanism to the narrator, which may explain part of the saturation of the pilots.
+
+Code: C1 (`src/utils/consistency_probe.py`), C2 and C3 (`directions` of `ProbeNarratives`), C4 (Reversal stays in the code, no paper config uses it), C5 and C6 (`arms`), C7 (`budget` of the Recourse conditions), C10 for the HuggingFace backend (per-prompt seeds, sampling saved per answer) and C11 (`self_evaluation`) are written and tested (`tests/narrative_arms_unit.py`). Not written: C8, C9 runs and C12 (offline, after the runs), and API backends with per-call seeds (OpenRouter refuses per-prompt seeds for now). The runs, their batches and the server steps are in `RUNS.md`.
+
+## 9. Update of 4 November 2026: protocol v2
+
+The padding turned out to be a framework-wide problem (task 0 of the research plan, `docs/v2/README.md`): the GCN oracles read the amount of padding, and the minimizers edited padding rows (a quarter of the BBBP minimized arm in the first smoke). The pairs pass now runs on protocol v2, which replaces D3:
+
+- **No padding.** Every graph at its own size, the oracles retrained without padding (and with the GCN layers their configs ask for). OracleView and FeatureNames stay. Nothing is hidden from the prompts any more.
+- **Isolated nodes deleted.** A node an edit leaves without edges is deleted; salt ions are removed at load. Deleted atoms are reported as `nodes_removed` and left out of the counterfactual's text.
+- **Seed arm.** DCE's nearest molecule of the other class, matched atom to atom by assignment and written as edits on the input (bond edits, atom substitutions, deleted atoms). It is always a counterfactual. With the assignment, the seed is far more readable than in v1 (BBBP: about 18 bond edits and 45 feature changes, against about 115 index-matched edits).
+- **Minimized arm.** BLS-F, the bounded local search over bond edits and atom substitutions towards the seed (`local_search_features`), not the first paper's edge-only BLS: with seeds that change atoms, the edge-only BLS often cannot improve and returns the seed, which would erase the minimality contrast. The paper should name it as the LBS variant with feature substitutions. BBBP: about 2.3 bond edits and 7.5 atom substitutions.
+- **Smokes.** BBBP 100 of 100 and AIDS 98 of 98 instances with the three arms valid, Tree-Cycles 64 all valid, and an E0 matrix prepares from these pairs. The configs and the tutorial (`RUNS.md`) are updated; the scopes are `narr-<dataset>_dce_lclsf`.
+- **Judges and prompts (4 November).** Until there is API access every judge is local: GPT-OSS-120B is the primary judge of the three probes and of the Recourse sweep, and GLM-4.7-Flash (another family, already used as a judge in Gianrico's pilots) is a local robustness judge on Reconstruction CTX-off/MODE-dict, Consistency and Recourse, a first part of E5. The Recourse prompt (Alejandra's FlipRateEvaluator task) no longer carries the unfilled `K={{K}}` placeholder: the goal states the budget K, and the original counterfactual is named as the judge sees it (ORIGINAL EDITS). The matrix runs on any `fast` GPU of the `cuda` partition, the jobs of one role side by side.
+- **Prompts (4 November, protocol 9).** Gianrico's prompts (the Reconstruction extractor, the two-part output schema, the graph text) are unchanged. The narrator's rules (the explanation pipeline's) ask for the root causes the modifications support, at most five, instead of "the top 3-5": three causes for a one-edit counterfactual invite invented ones and would bias the minimality factor. The Consistency judge prompt (new) was refined and checked for format with a small model. Open: the narrator prompts are long (median 8 to 9 thousand tokens; 4 % of BBBP and 11 % of AIDS above 16 384, a few up to 35 000), mostly redundant edge lists on Tree-Cycles and raw 23- to 42-column feature vectors on the molecules.

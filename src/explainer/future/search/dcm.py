@@ -54,6 +54,10 @@ class DCM(Explainer, Trainable):
         params['classify_with'] = params.get('classify_with', 'label')
         # RNG seed for reproducible candidate subsampling when proportion < 1.0
         params['random_seed'] = params.get('random_seed', 0)
+        # Protocol v2 (opt-in, read without being written into the config): return the nearest medoid of
+        # another class whose projection onto the input's nodes is a counterfactual
+        # (src/explainer/future/utils/projection.py). Without it, DCM behaves as always.
+        self.projection = params.get('projection')
 
     def init(self):
         self.device = "cpu"
@@ -130,7 +134,7 @@ class DCM(Explainer, Trainable):
                     g1 = instances[i]
                     for j in idxs_b:
                         g2 = instances[j]
-                        d = self.distance_metric.evaluate(g1, g2)
+                        d = self._distance(g1, g2)
                         cross_sum[i] += d
                         cross_sum[j] += d
                         pairs_done += 1
@@ -146,9 +150,43 @@ class DCM(Explainer, Trainable):
                 continue
             medoids[c] = min(idxs, key=lambda i: cross_sum[i])
 
-        self.model = medoids
-        self.logger.info(f"DCM: medoid indices = {self.model}")
+        if self.projection:
+            # Protocol v2: also the medoid of each class among its graphs of at most n nodes, for every n,
+            # as the running minimum of the same cross-class sums over the graphs sorted by size. An input
+            # of n nodes can reach exactly those (the isolated-node policy deletes what it does not need).
+            by_size = {}
+            for c, idxs in idx_by_class.items():
+                table, best = [], None
+                for i in sorted(idxs, key=lambda i: (len(instances[i].data), i)):
+                    if best is None or cross_sum[i] < cross_sum[best]:
+                        best = i
+                    size = len(instances[i].data)
+                    if table and table[-1][0] == size:
+                        table[-1] = (size, best)
+                    else:
+                        table.append((size, best))
+                by_size[c] = table
+            self.model = {"medoids": medoids, "by_size": by_size}
+        else:
+            self.model = medoids
+        self.logger.info(f"DCM: medoid indices = {medoids}")
         super().real_fit()
+
+    def _distance(self, g1, g2):
+        """v1: the cell-wise GED. v2 (projection): the structural edit cost under the correspondence."""
+        if not self.projection:
+            return self.distance_metric.evaluate(g1, g2)
+        from src.explainer.future.utils.projection import correspondence, structural_distance
+        return structural_distance(g1, g2, correspondence(g1, g2, self.projection))
+
+    def medoid_within(self, cls, n):
+        """Index of the medoid of class ``cls`` among its graphs of at most ``n`` nodes, or None."""
+        best = None
+        for size, idx in self.model["by_size"].get(cls, []):
+            if size > n:
+                break
+            best = idx
+        return best
 
     def _make_classifier(self):
         """Return a function that maps an instance to its class id."""
@@ -163,6 +201,9 @@ class DCM(Explainer, Trainable):
     def explain(self, instance):
         category = int(self.oracle.predict(instance))
         instances = self.dataset.instances
+
+        if self.projection:
+            return self.explain_projected(instance, category)
 
         best_d = float('inf')
         best_medoid = None
@@ -194,3 +235,42 @@ class DCM(Explainer, Trainable):
             input_instance=instance,
             counterfactual_instances=[cf_instance],
         )
+
+    def explain_projected(self, instance, input_label):
+        """Protocol v2 generator contract, as DCE's (src/explainer/search/dces.py) over the medoids and decided
+        by the generator alone: for each other class, its medoid among the graphs no larger than the input;
+        the nearest whose full projection the oracle classifies differently from the input, else the nearest
+        of them itself (seed_kind "fallback"; with classify_with "oracle" it is a counterfactual by
+        construction), else the global medoid of another class."""
+        import copy
+        from src.explainer.future.utils.projection import project, ranked_candidates
+        from src.utils.isolated import materialize, policy_of
+        instances = self.dataset.instances
+        n = len(instance.data)
+        others = [c for c in self.model["medoids"] if c != int(input_label)]
+        within = [self.medoid_within(c, n) for c in others]
+        candidates = [instances[i] for i in within if i is not None]
+        if not candidates:
+            candidates = [instances[self.model["medoids"][c]] for c in others]
+        ranked = ranked_candidates(instance, candidates, self.projection)
+        seed, info = None, {}
+        for _, _, candidate, mapping in ranked:
+            projected = project(instance, candidate, mapping, features=True)
+            if self.oracle.predict(projected) != input_label:
+                seed = projected
+                info = {"seed_kind": "projection", "candidate_id": candidate.id,
+                        "correspondences": [materialize(projected, policy_of(self.dataset))[1]]}
+                break
+        if seed is None and ranked:
+            _, _, candidate, mapping = ranked[0]
+            seed = copy.deepcopy(candidate)
+            info = {"seed_kind": "fallback", "candidate_id": candidate.id, "correspondences": [mapping]}
+        if seed is None:
+            seed = copy.deepcopy(instance)
+            info = {"seed_kind": "none"}
+        seed.id = instance.id
+        explanation = LocalGraphCounterfactualExplanation(context=self.context, dataset=self.dataset,
+                                                          oracle=self.oracle, explainer=self,
+                                                          input_instance=instance, counterfactual_instances=[seed])
+        explanation._info.update(info)
+        return explanation

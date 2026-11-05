@@ -13,15 +13,33 @@ class ReusedOriginalEdits(ValueError):
     """The proposal shares an elementary edit with the original counterfactual."""
 
 
-def build_prompt(graph_text, modifications_text, domain, narrative, target_label):
+class OverBudget(ValueError):
+    """The proposal makes more elementary edits than the budget K allows."""
+
+
+def edit_count(delta):
+    return sum(len(delta.get(key, [])) for key in DELTA_FIELDS)
+
+
+def build_prompt(graph_text, modifications_text, domain, narrative, target_label, budget=None):
     from src.LLMexplaneability.flip_rate_evaluation import FlipRateEvaluator
     original = FlipRateEvaluator(graph_text.rstrip() + '\n', modifications_text.rstrip() + '\n', domain.rstrip() + '\n',
                                  '' if narrative is None else 'EXPLANATION:\n' + narrative + '\n')
     system, prompt = original.flip_rate_prompt()
     # Keep the task/requirements; replace the old labeled full-vector format.
     system = system.split('**Requested output format')[0].split('6. Output')[0]
+    # The original prompt names the counterfactual G' and leaves the budget as a template placeholder; this
+    # prompt shows the edits as ORIGINAL EDITS and states the budget K, so both are named as the judge sees them.
+    system = system.replace('ONE alternative counterfactual edit sets (K={{K}}) that are',
+                            'ONE alternative counterfactual edit set' + ('' if budget is None else f' (at most K = {budget} elementary edits)')
+                            + ' that is')
+    system = system.replace("**different from the edits in G'**", '**different from the ORIGINAL EDITS**')
+    system = system.replace("in the same direction** as G'", 'in the same direction** as the original counterfactual')
+    system = system.replace("the exact edge or feature changes used in G'", 'the exact edge or feature changes listed in ORIGINAL EDITS')
+    if '{{' in system or "G'" in system:
+        raise ValueError('Unfilled placeholder or unnamed graph left in the Recourse prompt')
     if narrative is None:
-        system = system.replace('*for the same underlying reasons stated in the explanation*', '')
+        system = system.replace(' *for the same underlying reasons stated in the explanation*', '')
         system = system.replace('1. Your edits must operationalize the causal mechanisms described in the Explanation not just arbitrary perturbations.',
                                 '1. Propose edits using the factual graph and domain information.')
     system += ('\nFor this experiment return ONLY JSON with edges_added, edges_removed, '
@@ -33,6 +51,9 @@ def build_prompt(graph_text, modifications_text, domain, narrative, target_label
                'same node, feature column and from/to transition. '
                'Propose exactly one edit set, with no extra text.')
     prompt += f'\nTARGET ORACLE CLASS: {target_label}\n'
+    if budget is not None:
+        prompt += (f'BUDGET: at most {budget} elementary edits; each added edge, removed edge '
+                   'or changed node feature counts as one.\n')
     return system, prompt
 
 
@@ -67,7 +88,10 @@ def _reused_edits(proposal, original, directed, feature_map=None):
 def run(judge, items, predictor, mode='full', control=True, require_structured=False,
         success='target', edge_defaults=None, preprocess=None):
     """Each item supplies the factual GraphInstance, true delta, labels, texts,
-    domain and feature map. predictor receives an actual GraphInstance.
+    domain and feature map, and optionally a budget K: the most elementary edits
+    a proposal may make, stated in the prompt of both arms and enforced (a larger
+    proposal is ``over_budget`` and unsuccessful). predictor receives an actual
+    GraphInstance.
     """
     if success not in ('target', 'flip') or type(control) is not bool:
         raise ValueError('Invalid Recourse success criterion or control flag')
@@ -88,7 +112,8 @@ def run(judge, items, predictor, mode='full', control=True, require_structured=F
             record.update(status='oracle_error', error=f'{type(exc).__name__}: {exc}')
             continue
         for arm, narrative in [('with_explanation', text)] + ([('without_explanation', None)] if control else []):
-            prompts.append(build_prompt(item['graph_text'], item['modifications_text'], item['domain'], narrative, item['target_label']))
+            prompts.append(build_prompt(item['graph_text'], item['modifications_text'], item['domain'], narrative,
+                                        item['target_label'], item.get('budget')))
             owners.append((i, arm))
     for (index, arm), answer in zip(owners, call_many(judge, prompts)):
         item = items[index]
@@ -101,6 +126,8 @@ def run(judge, items, predictor, mode='full', control=True, require_structured=F
                 answer.update(status='judge_unparsed', error=str(exc))
             else:
                 try:
+                    if item.get('budget') is not None and edit_count(edits) > item['budget']:
+                        raise OverBudget(f'{edit_count(edits)} edits for a budget of {item["budget"]}')
                     reused = _reused_edits(edits, item['truth'], item['instance'].directed, item.get('feature_map'))
                     if reused:
                         answer.update(reused_edits=reused, reuse_phase='proposal')
@@ -130,6 +157,8 @@ def run(judge, items, predictor, mode='full', control=True, require_structured=F
                         raise ReusedOriginalEdits('Proposal reuses original edits after preprocessing')
                 except NotImplementedError as exc:
                     answer.update(status='unsupported_edits', error=str(exc))
+                except OverBudget as exc:
+                    answer.update(status='over_budget', successful=False, error=str(exc))
                 except ReusedOriginalEdits as exc:
                     answer.update(status='reused_original', successful=False, error=str(exc))
                 except (ValueError, IndexError, TypeError) as exc:
