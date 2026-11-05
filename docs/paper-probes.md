@@ -1,8 +1,9 @@
 # Independent graph probes
 
-This extension implements Reconstruction, Reversal and Recourse as normal
-GRETEL stages and as a second pass over saved explanations. TreeCycles is the
-first integration dataset. The probe utilities contain no TreeCycles oracle
+This extension implements Reconstruction, Reversal and Recourse as a second
+pass over explanations saved by a normal GRETEL run, and as GRETEL stages for
+configs that want the judge in the same pipeline. TreeCycles is the first
+integration dataset. The probe utilities contain no TreeCycles oracle
 rules, cycle detectors or dataset-specific scoring.
 
 The starting points are the branch's thesis-based Reconstruction,
@@ -29,11 +30,18 @@ model IDs must differ. Supplying generator/judge family identifiers also
 rejects a declared equal family; an omitted family cannot be inferred from
 an arbitrary model name.
 
-Stage model loading is deferred to the first `process` call. Upstream
+`ProbeNarratives` loads its generator at the first `process` call. Upstream
 `MainPipeline.init` constructs its stages twice; the discarded stage objects
 therefore do not load duplicate GPU models. Running generator and several
 judges together in one process still needs room for each active model;
 the two-pass runner loads a single judge at a time.
+
+The paper experiments use the two passes. The stages `Reconstruction`,
+`Reversal` and `Recourse` (in `src/evaluation/future/stages/`) take the
+options of a probe entry of the offline config, with one `context` and `mode`
+instead of the `conditions` list, plus `judge` and optionally `judge_family`.
+They must follow `ProbeNarratives` in the pipeline. They call the same code as
+`run_paper_probes.py`; a test checks that both give identical records.
 
 ## Shared answer and edit contracts
 
@@ -198,29 +206,26 @@ reasoning-only answers. Harmony markers follow the model's
 It also recognizes flattened `analysis...assistantfinalYES` outputs observed
 on the cluster, even without an initial `assistantanalysis` role prefix.
 Reversal still requires exactly YES or NO in the final answer; extra prose is
-an error. Version 3 separated corrected Harmony results; version 4 also handles
-Muse's `to=self`/`to=user` framing and records cached checkpoint revisions.
+an error. The backend also handles Muse's `to=self`/`to=user` framing and
+records cached checkpoint revisions.
 This parsing check does not replace a live backend smoke test.
 
-## First real-model TreeCycles pilot
 
-Run from the repository root, in the existing cluster GRTL environment:
+## Running
+
+From the repository root. `scripts/slurm_paper_probes.sh` wraps both passes
+for a Slurm cluster; it waits for free memory on the assigned GPU
+(`MIN_FREE_MB`, `MAX_WAIT`, `WAIT_STEP`) and activates the conda environment
+named in the script.
 
 ```bash
 mkdir -p lab/output/logs
-sbatch scripts/slurm_paper_probes.sh generate lab/config/probes/paper_treecycles_generate.jsonc
-# After generation finishes:
-sbatch scripts/slurm_paper_probes.sh probe lab/config/probes/paper_judge_gpt-oss-20b.jsonc lab/output/results/paper-probes-pilot
+gen_job=$(sbatch --parsable scripts/slurm_paper_probes.sh generate lab/config/probes/paper_treecycles_28nodes_generate.jsonc)
+sbatch --dependency="afterok:${gen_job%%;*}" scripts/slurm_paper_probes.sh probe lab/config/probes/paper_treecycles_28nodes_judge.jsonc lab/output/results/paper-probes-tcr-500-28
 ```
 
-The generation config uses 50 seeded graphs with 16 nodes, ten splits and
-fold 0 (about five held-out instances), TreeCyclesOracle, and the existing
-DCE + LocalSearch GenerateMinimize. It generates narratives only for the
-final CF. The first-pass generator is Qwen3-8B; the independent second-pass
-judge is gpt-oss-20b. GPU memory/runtime compatibility must be checked on the
-actual cluster; no live model run is implied by the local tests.
-
-An independent probe invocation is:
+The probe pass reads every saved dump; `SAMPLE_LIMIT=N` restricts it to the
+first N. Without Slurm, the second pass is:
 
 ```bash
 python scripts/run_paper_probes.py --config lab/config/probes/paper_judge_gpt-oss-20b.jsonc \
@@ -368,10 +373,10 @@ structure and edge weights, never the RDKit bond features or the SMILES/RDKit
 object kept as graph features; the `OracleView` manipulator removes them, so
 the explained graph is the one the oracle uses, prompts carry no SMILES, and
 the explainers' candidates (built without them) are not reported as
-unsupported changes. `SeededMolGenerator` seeds the molecule order:
-`MolGenerator` shuffles with the unseeded global random state, while the cache
-keeps only split indices, so each new process would otherwise put different
-molecules in the cached folds. Forty stratified splits without
+unsupported changes. `MolGenerator` seeds its molecule shuffle with the
+configured `seed` (default 0). The cache keeps only split indices, so this
+deterministic order preserves the mapping of molecules to the cached folds
+across processes. Forty stratified splits without
 shuffling leave about 51 molecules in fold 0; the oracle trains on the other
 folds, and its logged test accuracy is on the explained molecules.
 
@@ -451,6 +456,24 @@ New protocol identities and fresh rerun directories keep previous results
 separate from corrected evaluations. Local scripted tests cannot establish
 whether a real model will produce a valid final answer.
 
+## Configurations
+
+All under `lab/config/probes/`; each file's header describes its setup.
+
+| Generation | Judge | Setup |
+|---|---|---|
+| `paper_treecycles_generate.jsonc` | `paper_judge_gpt-oss-20b.jsonc` | First integration run: 50 TreeCycles graphs of 16 nodes |
+| `paper_treecycles_10nodes_generate.jsonc` | `paper_treecycles_10nodes_judge.jsonc` | Mini run: 10 graphs of 10 nodes, 5 explained; source of the model matrix |
+| `paper_treecycles_28nodes_generate.jsonc` | `paper_treecycles_28nodes_judge.jsonc` | TreeCycles as in the LBS paper: 500 graphs, 28 nodes, DCE + LocalSearch |
+| `paper_bbbp_ofs_generate.jsonc` | `paper_bbbp_ofs_judge.jsonc` | BBBP with OFS on the molecule itself, no padding |
+| `paper_bbbp_dce_generate.jsonc` | `paper_bbbp_dce_judge.jsonc` | BBBP with the thesis setup (padding, DCE), padding hidden from prompts |
+| `paper_aids_dce_generate.jsonc` | `paper_aids_dce_judge.jsonc` | AIDS with the BBBP DCE setup and named feature columns |
+
+`lab/config/snippets/paper_generation_pipeline.json` is the first-pass
+pipeline (Qwen3-8B generator). The molecule configs use `MolGenerator` (seeded shuffle),
+`OracleView` (drops bond features and SMILES, which the GCN oracles never
+read) and, for AIDS, `FeatureNames`.
+
 ## Local technical feedback
 
 ```bash
@@ -460,12 +483,11 @@ python tests/reconstruction_probe_unit.py
 python tests/paper_probes_unit.py
 ```
 
-The last test runs five graphs from the real seeded TreeCycles generator
+The last test runs five graphs from the real TreeCyclesRand generator
 through real stages, saving/reloading, factories and TreeCyclesOracle. Its
 CF explainer and LLM replies are explicitly scripted test fixtures.
 On a machine lacking torch, `--light` isolates only the unused utils package
 initializer and Dataset annotation import. It does not emulate oracle
 predictions. `--demo-output /absolute/path` retains reviewable input dumps,
 proposal graphs and summaries. Those perfect synthetic scores verify the
-software; they are not paper results. Full environment/import checks and the
-GPU pilot remain separate validation steps.
+software; they are not paper results. The tests do not run a real model.

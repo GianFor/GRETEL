@@ -47,8 +47,10 @@ case "$pass" in
   probe)
     results=${3:?missing results root}
     extra=()
-    [ -z "${4:-}" ] || extra=(--probe "$4")
-    srun python scripts/run_paper_probes.py --config "$config" --results "$results" --limit "${SAMPLE_LIMIT:-5}" "${extra[@]}"
+    [ -z "${4:-}" ] || extra+=(--probe "$4")
+    # All dumps unless SAMPLE_LIMIT is set
+    [ -z "${SAMPLE_LIMIT:-}" ] || extra+=(--limit "$SAMPLE_LIMIT")
+    srun python scripts/run_paper_probes.py --config "$config" --results "$results" "${extra[@]}"
     ;;
   matrix-generator)
     srun python scripts/paper_probe_matrix.py run-generator --run-root "$config" --generator "${3:?missing generator ID}"

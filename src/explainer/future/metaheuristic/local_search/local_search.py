@@ -13,6 +13,7 @@ from typing import Generator
 from src.explainer.future.metaheuristic.initial_solution_search.simple_searcher import SimpleSearcher
 from src.explainer.future.metaheuristic.local_search.binary_model import BinaryModel
 from src.explainer.future.metaheuristic.local_search.cache import FixedSizeCache
+from src.explainer.future.metaheuristic.local_search.attribute_methods import build_methods, THESIS_METHODS, SEVEN_METHODS
 from src.explainer.future.metaheuristic.manipulation.methods import average_smoothing, average_smoothing_zero, feature_aggregation, heat_kernel_diffusion, identity, laplacian_regularization, random_walk_diffusion, weighted_smoothing
 from src.future.explanation.local.graph_counterfactual import LocalGraphCounterfactualExplanation
 from src.utils.cfg_utils import init_dflts_to_of
@@ -63,21 +64,27 @@ class LocalSearch(ExplanationMinimizer):
         # ``seed`` keep their hash and stay non-deterministic as before.
         set_seed(self.local_config['parameters'].get('seed'))
 
+        # Opt-in (hash-stable): stop the moment the minimizer has spent
+        # ``max_oracle_calls``. Without it the cap is only checked between outer
+        # iterations, and one iteration on a large graph can overshoot it by an
+        # order of magnitude. Needed for equal-budget comparisons.
+        self.strict_budget = self.local_config['parameters'].get('strict_budget', False)
+
+        # Opt-in (hash-stable): end the search after the first outer iteration
+        # that improves nothing, as the BLS pseudocode states (repeat until no
+        # strategy accepts). Without it, up to ``max_runtime`` further outer
+        # iterations are run, each repeating the whole neighbourhood sweep.
+        self.stop_after_failed_iteration = self.local_config['parameters'].get('stop_after_failed_iteration', False)
+
         self.tagger = SimpleTagger()
         
         self.searcher = SimpleSearcher()
         
         self.distance_metric = GraphEditDistanceMetric()  
         
-        self.methods = [
-            lambda data, features: identity(data, features),
-            lambda data, features: average_smoothing(data, features, iterations=1),
-            lambda data, features: weighted_smoothing(data, features, iterations=1),
-            lambda data, features: laplacian_regularization(data, features, lambda_reg=0.01, iterations=1),
-            lambda data, features: feature_aggregation(data, features, alpha=0.5, iterations=1),
-            # lambda data, features: heat_kernel_diffusion(data, features, t=0.5),
-            lambda data, features: random_walk_diffusion(data, features, steps=1)
-        ]
+        # Attribute strategies by name (attribute_methods.py); opt-in and hash-stable: without the
+        # parameter, the six this module always evaluated, in the same order.
+        self.methods = build_methods(self.local_config['parameters'].get('attribute_methods', THESIS_METHODS))
         
         
 
@@ -135,7 +142,7 @@ class LocalSearch(ExplanationMinimizer):
             # self.logger.info("k: " + str(self.k))
             n-=1
             if(len(best) == 1) : break
-            if(self.k > self.max_oracle_calls) :
+            if(self.k > self.max_oracle_calls or self._out_of_budget()) :
                  self.logger.info("Oracle calls limit reached")
                  break
             found = False
@@ -143,6 +150,8 @@ class LocalSearch(ExplanationMinimizer):
             # self.logger.info("actual ---> " + str(len(actual)))
             
             for s in self.edge_remove(actual):
+                if self._out_of_budget():
+                    break
                 if(self.cache.contains(s)):
                     continue
                 self.cache.add(s)
@@ -156,7 +165,7 @@ class LocalSearch(ExplanationMinimizer):
                     break
                 
             if(found):
-                self.logger.info("============> (-) Found solution with size: " + str(len(actual)))
+                self.logger.info("============> (-) Found solution with size: " + str(len(actual)) + ", calls: " + str(self.k))
                 continue
             
             half = int(len(actual) / 2)
@@ -167,6 +176,8 @@ class LocalSearch(ExplanationMinimizer):
             while(len(best) - len(actual) > 1):
                 n-=1
                 for s in self.edge_swap(actual):
+                    if self._out_of_budget():
+                        break
                     if(self.cache.contains(s)):
                         # print("in cache")
                         continue
@@ -182,13 +193,15 @@ class LocalSearch(ExplanationMinimizer):
                         break
                     
                 if(found):
-                    self.logger.info("============> (=) Found solution with size: " + str(len(actual)))
+                    self.logger.info("============> (=) Found solution with size: " + str(len(actual)) + ", calls: " + str(self.k))
                     break
 
                 actual = self.reduce_random(best, len(actual))
                 # self.logger.info("actual ===> " + str(len(actual)))
                 
                 for s in self.edge_add(actual, best):
+                    if self._out_of_budget():
+                        break
                     if(self.cache.contains(s)):
                         # print("in cache")
                         continue
@@ -204,7 +217,7 @@ class LocalSearch(ExplanationMinimizer):
                         break
                     
                 if(found):
-                    self.logger.info("============> (+) Found solution with size: " + str(len(actual)))
+                    self.logger.info("============> (+) Found solution with size: " + str(len(actual)) + ", calls: " + str(self.k))
                     break
                 
                 to_expand = int(((len(best) - len(actual)) / 2)) + 1
@@ -213,13 +226,20 @@ class LocalSearch(ExplanationMinimizer):
                 if(expand > len(best)): break
                 actual = self.reduce_random(best, expand)
                 self.logger.info("actual +++> " + str(len(actual)))
-          
+
+            if self.stop_after_failed_iteration and not found:
+                self.logger.info("outer iteration without improvement, stopping (calls: " + str(self.k) + ")")
+                break
+
         if(self.oracle.predict(result) == self.oracle.predict(self.G)):
             self.logger.info("ERROR, returning non ctf ")
             self.logger.info("instance -> " + str(self.oracle.predict(self.G)))
             self.logger.info("result -> " + str(self.oracle.predict(result)))
         return result
     
+    def _out_of_budget(self) -> bool:
+        return self.strict_budget and self.k >= self.max_oracle_calls
+
     def evaluate(self, solution : set[int]) -> tuple[bool, GraphInstance]:
         new_data = np.copy(self.G.data)
         self.disturb(new_data, self.G.directed, solution)
@@ -227,6 +247,8 @@ class LocalSearch(ExplanationMinimizer):
         # If the dataset has attributes in the nodes, then lets explore those with the methods
         if(self.attributed):
             for method in self.methods:
+                if self._out_of_budget():
+                    break
                 self.k += 1
                 node_features = method(new_data, self.G.node_features)
                 new_g = GraphInstance(id=self.G.id,
@@ -238,7 +260,7 @@ class LocalSearch(ExplanationMinimizer):
         
         # If the dataset does not has attributes, then it has ficticial attributes for GCN to work,
         # in that case, we just call the manipulator method
-        else:
+        elif not self._out_of_budget():
             self.k += 1
             new_g = GraphInstance(id=self.G.id,
                                         label=0,
@@ -306,7 +328,10 @@ class LocalSearch(ExplanationMinimizer):
     def edge_remove(self, solution: set[int]) -> Generator[set[int], None, None]:
         cealing = len(solution)
         step = int((cealing / self.max_neigh) + 1)
-        for i in range(0, cealing, step):
+        # Levels start at one edge (the pseudocode's single-edit removal, 1a). The thesis runs
+        # started at level 0 (the unchanged solution) and so skipped single edges whenever step > 1,
+        # that is, for every |S| >= max_neigh.
+        for i in range(1, cealing, step):
             for _ in range(self.neigh_factor ** 3):
                 yield self.remove_random(set(solution), i)
                 
