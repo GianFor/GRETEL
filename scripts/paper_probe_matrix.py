@@ -102,7 +102,7 @@ def model_config(config, entry, role):
     parameters = {**config['model_defaults'], **entry['parameters']}
     result = {'experiment': {'scope': config['scope']},
               'compose_strs': 'lab/config/snippets/default_store_paths.json',
-              role: {'class': 'src.LLMexplaneability.huggingface.HuggingFaceLLM', 'parameters': parameters},
+              role: {'class': entry.get('class', 'src.LLMexplaneability.huggingface.HuggingFaceLLM'), 'parameters': parameters},
               role + '_family': entry['family']}
     if role == 'judge':
         result['probes'] = copy.deepcopy(entry.get('probes', config['probes']))
@@ -163,6 +163,9 @@ def prepare(config_path, source, destination=None):
             write_json(run / 'configs' / ('self-' + entry['id'] + '.json'), self_config(config, entry))
     manifest = {'configuration': config, 'sources': sources,
                 'source_fingerprint': hashlib.sha256(json.dumps(sources, sort_keys=True).encode()).hexdigest(),
+                # The pairs themselves, independent of paths: equal in two runs (two accounts, two halves of the
+                # narrators) prepared from the same first passes, so their results can be merged.
+                'content_fingerprint': hashlib.sha256(json.dumps(sorted(s['sha256'] for s in sources)).encode()).hexdigest(),
                 'code_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()}
     write_json(run / 'matrix.json', manifest)
     print('Matrix:', run, flush=True)
@@ -300,10 +303,15 @@ def submit(run, dry_run=False, include_generators=True, only=None, after=None):
                '--job-name=pm-' + role[:3] + '-' + entry['id'],
                f'--export=ALL,MIN_FREE_MB={settings["min_free_mb"]},MAX_WAIT={settings["max_wait"]},HF_HUB_OFFLINE=1,TRANSFORMERS_OFFLINE=1'
                + (f',GRETEL_ENV={settings["env"]}' if 'env' in settings else '')]
-        for option in ('partition', 'gres'):
-            if option in settings:
-                cmd.append(f'--{option}=' + settings[option])
-        if 'node' in settings:
+        if entry.get('cpu'):
+            # A model that needs no GPU (the synthetic narrators of V0): a CPU node, no GPU wait.
+            cmd[-1] += ',SKIP_GPU_WAIT=1'
+            cmd += ['--partition=' + settings.get('cpu_partition', 'normal'), '--gres=none']
+        else:
+            for option in ('partition', 'gres'):
+                if option in settings:
+                    cmd.append(f'--{option}=' + settings[option])
+        if 'node' in settings and not entry.get('cpu'):
             cmd.append('--nodelist=' + settings['node'])
         if settings.get('parallel') and after:
             cmd.append('--dependency=afterany:' + after)
@@ -327,6 +335,58 @@ def submit(run, dry_run=False, include_generators=True, only=None, after=None):
             with ledger.open('a') as stream:
                 stream.write(json.dumps({'role': role, 'model': entry['parameters']['model'], 'id': entry['id'], 'job_id': previous}) + '\n')
             print(role, entry['id'], 'job', previous, flush=True)
+
+
+def fleet(runs, maximum, dry_run=False):
+    """Every job of several prepared runs as throttled Slurm arrays, launched once and left running.
+
+    Per run, in the order given (e.g. Tree-Cycles, then BBBP, then AIDS): one array of its generators and one
+    of its judges and self jobs, which waits for that generators array (afterany: a failed generator leaves an
+    error cell, the other cells go on). The generator arrays are chained in run order, so the first dataset is
+    narrated first, and each array runs at most ``maximum`` tasks at a time; the judges of a run work while the
+    next run's generators do. CPU models (the synthetic narrators of V0) get their own array on the CPU
+    partition. Lists of the tasks: <run>/fleet/<array>.list (role, run, id per line)."""
+    import shlex
+    previous_generators = None
+    for run in runs:
+        manifest = json.loads((run / 'matrix.json').read_text())
+        config, settings = manifest['configuration'], manifest['configuration']['slurm']
+        (run / 'fleet').mkdir(exist_ok=True)
+        groups = [('generators', [('generator', e) for e in config['generators']]),
+                  ('evaluators', [('judge', e) for e in config['judges']]
+                   + ([('self', e) for e in config['generators']] if 'self_evaluation' in config else []))]
+        generators_job = None
+        for name, tasks in groups:
+            for cpu in (True, False):
+                part = [(role, e) for role, e in tasks if bool(e.get('cpu')) == cpu]
+                if not part:
+                    continue
+                listing = run / 'fleet' / f'{name}{"-cpu" if cpu else ""}.list'
+                listing.write_text(''.join(f'{role} {run} {e["id"]}\n' for role, e in part))
+                export = (f'--export=ALL,MIN_FREE_MB={settings["min_free_mb"]},MAX_WAIT={settings["max_wait"]},'
+                          f'HF_HUB_OFFLINE=1,TRANSFORMERS_OFFLINE=1' + (f',GRETEL_ENV={settings["env"]}' if 'env' in settings else '')
+                          + (',SKIP_GPU_WAIT=1' if cpu else ''))
+                cmd = ['sbatch', '--parsable', '--chdir=' + str(ROOT), '--time=' + settings['time'], '--mem=' + settings['mem'],
+                       f'--array=0-{len(part) - 1}%{maximum}', f'--job-name=pm-{name[:3]}-{run.name}', export]
+                cmd += (['--partition=' + settings.get('cpu_partition', 'normal'), '--gres=none'] if cpu else
+                        [f'--{o}=' + settings[o] for o in ('partition', 'gres') if o in settings])
+                after = previous_generators if name == 'generators' else generators_job
+                if after:
+                    cmd.append('--dependency=afterany:' + after)
+                cmd += ['scripts/slurm_paper_probes.sh', 'array', str(listing)]
+                if dry_run:
+                    print(shlex.join(cmd))
+                    job = f'<{name}-{run.name}>'
+                else:
+                    job = subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True, check=True).stdout.strip().split(';')[0]
+                    with (run / 'jobs.jsonl').open('a') as stream:
+                        for index, (role, e) in enumerate(part):
+                            stream.write(json.dumps({'role': role, 'id': e['id'], 'model': e['parameters']['model'],
+                                                     'job_id': f'{job}_{index}'}) + '\n')
+                    print(f'{run.name} {name}{" (cpu)" if cpu else ""}: array {job}, {len(part)} tasks, at most {maximum} at a time', flush=True)
+                if name == 'generators':
+                    generators_job = job if generators_job is None else f'{generators_job}:{job}'
+        previous_generators = generators_job
 
 
 def frozen_dumps(run):
@@ -500,6 +560,10 @@ def main(argv=None):
     rerun.add_argument('--judge', action='append')
     rerun.add_argument('--probe', action='append')
     rerun.add_argument('--dry-run', action='store_true')
+    command = commands.add_parser('fleet')
+    command.add_argument('--run-root', action='append', required=True, help='prepared run; repeat, in run order')
+    command.add_argument('--max', type=int, default=4, help='tasks of one array running at a time')
+    command.add_argument('--dry-run', action='store_true')
     for name in ('run-generator', 'run-judge', 'run-self', 'summary'):
         command = commands.add_parser(name)
         command.add_argument('--run-root', required=True)
@@ -517,6 +581,9 @@ def main(argv=None):
     for variable in ('OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
                      'VECLIB_MAXIMUM_THREADS', 'NUMEXPR_NUM_THREADS'):
         os.environ[variable] = '1'
+    if args.command == 'fleet':
+        fleet([Path(r).resolve() for r in args.run_root], args.max, args.dry_run)
+        return 0
     if args.command == 'submit' and args.run_root:
         submit(Path(args.run_root).resolve(), args.dry_run, only=args.only.split(',') if args.only else None,
                after=args.after)
