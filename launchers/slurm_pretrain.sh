@@ -22,7 +22,13 @@ for base in "${CONDA_EXE:+$(dirname "$(dirname "$CONDA_EXE")")}" "$HOME/minicond
     fi
 done
 echo "# job ${SLURM_JOB_ID:-?} on $(hostname), started $(date '+%Y-%m-%d %H:%M:%S'): $*"
-CUDA_VISIBLE_DEVICES="" python scripts/pretrain_selector_checkpoints.py --datasets "$@"
+# A first argument --v2 selects protocol v2 (scripts/pretrain_selector_checkpoints.py --v2), and a following
+# --features its arms with BLS-F substitutions (collect2f collections, sel2f-pre checkpoints).
+V2=""; FEAT=""
+if [ "${1:-}" = "--v2" ]; then V2="--v2"; shift; fi
+if [ "${1:-}" = "--features" ]; then FEAT="--features"; shift; fi
+if [ "${1:-}" = "--dcem" ]; then FEAT="$FEAT --dcem"; shift; fi
+CUDA_VISIBLE_DEVICES="" python scripts/pretrain_selector_checkpoints.py $V2 $FEAT --datasets "$@"
 STATUS=$?
 echo "# finished $(date '+%Y-%m-%d %H:%M:%S') with exit status $STATUS"
 exit $STATUS

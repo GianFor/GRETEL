@@ -31,14 +31,19 @@ with ``compose`` whose value is a file, also inside ``propagate`` blocks):
 * a composed snippet is written to ``lab/config/v2/<its path under lab/config>`` (``lab/config/v2/<its path>``
   for the few outside it, the legacy snippets) and the reference points there;
 * every plain BLS cell of the first paper with DCE or DCM also gets a BLS-F arm (``<gen>-lclsf``,
-  local_search_features: edge edits and node-feature substitutions towards the seed).
+  local_search_features: edge edits and node-feature substitutions towards the seed);
+* every selector arm gets its BLS-F twin (``<arm>-f``, decided 2026-11-06): bls_v0 becomes BLS-F itself, and
+  bls_v1, selector_v1, the untrained control and the collections run the selector skeleton with
+  ``feature_substitutions`` (substitutions proposed uniformly, the selector scoring edges only, no attribute
+  methods), with their own collections (``<cell>_collect2f-f<c>.pt``) and checkpoints
+  (``edge_selector_sel2f-pre_<cell>-f<c>.pt``, ``scripts/pretrain_selector_checkpoints.py --v2 --features``).
 
 Sources, regenerated from their current v1 definitions every time this runs:
 
 * ``paper1``: the cells of ``scripts/gen_rerun_queues.py`` (thesis and paper revision), without RSGG and DBS,
   and with DFS only on the fixed-size datasets (its prior is per node index, meaningful only when index i is
   the same node in every graph; DBS, which shares that prior, waits for an adapted one);
-* ``selector``: every config of the selector paper's batches (``docs/selector/PAPER_B*.md``).
+* ``selector``: every config of the selector paper's arms in every cell of its matrix (the v1 tree).
 
 Configs that use a fixed-size explainer are skipped and listed. The run order is decided later; this only
 writes the configs and ``docs/v2/CONFIGS.md``, the index.
@@ -73,6 +78,7 @@ DCM = "src.explainer.future.search.dcm.DCM"
 DCM_PROPORTION = {"colors-3": 0.2, "proteins": 0.5}    # 10 500 graphs; graphs of up to 620 nodes
 BLS = "src.explainer.future.metaheuristic.local_search.local_search.LocalSearch"
 BLSF = "src.explainer.future.metaheuristic.local_search.local_search_features.LocalSearch"
+SELECTOR_SKELETON = "src.explainer.future.metaheuristic.local_search.local_search_selection_net_v2.LocalSearch"
 EDIT_STAGES = [f"src.evaluation.future.stages.edit_distance.{name}"
                for name in ("EditDistance", "StructuralEditDistance", "MatchedFeatureDistance")]
 PROJECTED = ("src.explainer.future.search.dces.DCESExplainer", "src.explainer.future.search.dcm.DCM")
@@ -166,6 +172,12 @@ class Transformer:
         self.cell = cell
         data = self.node(read_jsonc(REPO / rel))
         data["experiment"]["scope"] = PREFIX + data["experiment"]["scope"]
+        # DCEM's fallback scan (2026-11-07): with no medoid projecting to a counterfactual, DCE's candidates
+        # before falling back (generate_minimize.py, dcm.py); its fold-0 sondeo cut the fallbacks to DCE's.
+        for triplet in data.get("doe-triplets", []):
+            explainer = triplet.get("explainer", {})
+            if explainer.get("parameters", {}).get("generator", {}).get("class") == DCM:
+                explainer["parameters"]["fallback_scan"] = True
         if self.policy == "delete" and "compose_man" not in json.dumps(data):
             raise ValueError(f"{rel}: no manipulator snippet to carry the isolated-node policy")
         return v2_path(rel), data
@@ -185,6 +197,75 @@ def bls_f(rel: str, data: dict) -> tuple[str, dict]:
     return str(Path(*parts[:-2], variant.replace("-lcls", "-lclsf"), parts[-1])), data
 
 
+def selector_f(rel: str, data: dict) -> tuple[str, dict]:
+    """The BLS-F twin of a selector arm: variant and scope suffix -f; bls_v0 becomes BLS-F, every other arm the same
+    skeleton with feature_substitutions, its own model tag, collection and pretrained checkpoint."""
+    data = json.loads(json.dumps(data))
+    minimizer = data["doe-triplets"][0]["explainer"]["parameters"]["minimizer"]
+    par = minimizer["parameters"]
+    par["attributed"] = False
+    if minimizer["class"] == BLS:
+        minimizer["class"] = BLSF
+    else:
+        assert minimizer["class"] == SELECTOR_SKELETON, rel
+        par["feature_substitutions"] = True
+        par["model_tag"] = par["model_tag"].replace(PREFIX, PREFIX + "f-", 1)
+        if "init_checkpoint" in par:
+            assert "sel2-pre_" in par["init_checkpoint"], rel
+            par["init_checkpoint"] = par["init_checkpoint"].replace("sel2-pre_", "sel2f-pre_")
+        if "collect_examples" in par:
+            assert "_collect2-f" in par["collect_examples"], rel
+            par["collect_examples"] = par["collect_examples"].replace("_collect2-f", "_collect2f-f")
+    data["experiment"]["scope"] += "-f"
+    parts = Path(rel).parts
+    return str(Path(*parts[:-2], parts[-2] + "-f", parts[-1])), data
+
+
+OBS_MIN = {"class": "src.explainer.future.meta.minimizer.obs.OBS", "parameters": {"max_oc": 4000, "changes_batch_size": 5, "seed": 0}}
+RHC_MIN = {"class": "src.explainer.future.metaheuristic.local_search.random_hill_climbing.RandomHillClimbing",
+           "parameters": {"manip_attr": False, "max_oracle_calls": 10000, "patience": 40, "seed": 0}}
+DUMMY_MIN = {"class": "src.explainer.future.meta.minimizer.dummy.Dummy",
+             "parameters": {"neigh_factor": 4, "runtime_factor": 4, "max_runtime": 20, "max_neigh": 20}}
+# Phase 1 (2026-11-08): the selector paper's ladder on DCEM seeds, others < bls_v0 < bls_v1-F < selector_v1-F,
+# with the selector's ablation (untrained control-F) and the collections-F it is pretrained from.
+DCEM_FROM_F = ("dce-lcls-v1-f", "dce-lcls-sel-v1-f", "dce-lcls-sel-v1-untrained-f", "dce-lcls-collect2-f")
+DCEM_FROM_V0 = {"dce-lcls-v0": None, "dcm-dummy": DUMMY_MIN, "dcm-obs": OBS_MIN, "dcm-rhc": RHC_MIN}
+
+
+def dcem_twin(rel: str, data: dict, minimizer: dict | None = None, variant: str | None = None) -> tuple[str, dict]:
+    """The DCEM twin of a selector-cell config: generator DCM (v2 contract, fallback scan), variant and scope
+    dce -> dcm; the F arms get their own model tag, collection (collect2fm) and checkpoint (sel2fm-pre). With
+    ``minimizer`` (from bls_v0), another minimizer of the ladder in the same cell (dummy, OBS, RHC)."""
+    data = json.loads(json.dumps(data))
+    cell = Path(rel).parts[4]          # lab/config/v2/generate_minimize/<cell>/...
+    explainer = data["doe-triplets"][0]["explainer"]
+    gen = {"class": DCM, "parameters": {"epochs": 500, "projection": "assignment", "classify_with": "oracle"}}
+    if cell.startswith(tuple(DCM_PROPORTION)):
+        gen["parameters"]["proportion"] = next(v for k, v in DCM_PROPORTION.items() if cell.startswith(k))
+    explainer["parameters"]["generator"] = gen
+    explainer["parameters"]["fallback_scan"] = True
+    par = explainer["parameters"]["minimizer"]["parameters"]
+    if minimizer is not None:
+        attributed = par.get("attributed", False)
+        new = json.loads(json.dumps(minimizer))
+        if new["class"] != OBS_MIN["class"]:
+            new["parameters"]["attributed"] = attributed
+        explainer["parameters"]["minimizer"] = new
+    else:
+        if "model_tag" in par:
+            par["model_tag"] = par["model_tag"].replace(PREFIX + "f-", PREFIX + "fm-", 1)
+        if "init_checkpoint" in par:
+            par["init_checkpoint"] = par["init_checkpoint"].replace("sel2f-pre_", "sel2fm-pre_")
+        if "collect_examples" in par:
+            par["collect_examples"] = par["collect_examples"].replace("_collect2f-f", "_collect2fm-f")
+    parts = Path(rel).parts
+    new_variant = variant or parts[-2].replace("dce-", "dcm-", 1)
+    scope = data["experiment"]["scope"]
+    head = scope.split("_dce_")[0]
+    data["experiment"]["scope"] = f"{head}_dcm_{new_variant.removeprefix('dcm-')}"
+    return str(Path(*parts[:-3], "dcm", new_variant, parts[-1])), data
+
+
 def paper1_configs() -> list[str]:
     out = []
     for ds, gen, var in sorted(cells()):
@@ -199,10 +280,15 @@ def paper1_configs() -> list[str]:
 
 
 def selector_configs() -> list[str]:
+    """Every config of the selector paper's arms in every cell of its matrix, from the v1 tree. Not from its batches
+    (docs/selector/PAPER_B*.md): those leave out what already had v1 results, which v2 has to run too."""
+    from gen_selector_paper_matrix import cells as selector_cells
+    arms = ("dce-lcls-v0", "dce-lcls-v1", "dce-lcls-sel-v1", "dce-lcls-sel-v1-untrained", "dce-lcls-collect2")
     out = []
-    for queue in sorted((REPO / "docs/selector").glob("PAPER_B*.md")):
-        out += [m.group(1) for m in re.finditer(r"^- \[[ x]\] (\S+)$", queue.read_text(), re.MULTILINE)]
-    return sorted(set(out))
+    for cell in selector_cells():
+        for arm in arms:
+            out += sorted(str(p.relative_to(REPO)) for p in (REPO / TREE / f"{cell}-sel" / "dce" / arm).glob("generate_minimize*.jsonc"))
+    return out
 
 
 def main() -> int:
@@ -238,6 +324,38 @@ def main() -> int:
                 written[f_target] = family
                 fp = Path(f_target).parts
                 rows.append((family, fp[4], fp[5], fp[6]))
+            # phase 1: the DCEM twins of the selector paper's ladder (2026-11-08)
+            if family == "selector" and Path(target).parts[-2] in DCEM_FROM_V0:
+                for variant, mini in DCEM_FROM_V0.items():
+                    d_target, d_data = dcem_twin(target, data, mini, None if mini is None else variant)
+                    if d_target in written:
+                        continue
+                    d_out = REPO / d_target
+                    d_out.parent.mkdir(parents=True, exist_ok=True)
+                    d_out.write_text(f"// Protocol v2 DCEM arm of the selector paper, generated by scripts/gen_v2_configs.py "
+                                     f"from {rel}: do not edit.\n" + json.dumps(d_data, indent=4) + "\n")
+                    written[d_target] = family
+                    dp = Path(d_target).parts
+                    rows.append((family, dp[4], dp[5], dp[6]))
+            # the BLS-F twin of every selector arm (2026-11-06)
+            if family == "selector":
+                f_target, f_data = selector_f(target, data)
+                f_out = REPO / f_target
+                f_out.parent.mkdir(parents=True, exist_ok=True)
+                f_out.write_text(f"// Protocol v2 selector arm with BLS-F substitutions, generated by scripts/gen_v2_configs.py "
+                                 f"from {rel}: do not edit.\n" + json.dumps(f_data, indent=4) + "\n")
+                written[f_target] = family
+                fp = Path(f_target).parts
+                rows.append((family, fp[4], fp[5], fp[6]))
+                if Path(f_target).parts[-2] in DCEM_FROM_F:
+                    d_target, d_data = dcem_twin(f_target, f_data)
+                    d_out = REPO / d_target
+                    d_out.parent.mkdir(parents=True, exist_ok=True)
+                    d_out.write_text(f"// Protocol v2 DCEM arm of the selector paper, generated by scripts/gen_v2_configs.py "
+                                     f"from {rel}: do not edit.\n" + json.dumps(d_data, indent=4) + "\n")
+                    written[d_target] = family
+                    dp = Path(d_target).parts
+                    rows.append((family, dp[4], dp[5], dp[6]))
     index = Counter(rows)
     lines = ["# Protocol v2 configs", "",
              "Generated by `scripts/gen_v2_configs.py` (its docstring gives the transformation). Do not edit the files "

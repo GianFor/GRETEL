@@ -9,6 +9,13 @@ next to it. Idempotent: run it after every collection. The first sondeo's checkp
 (``edge_selector_sel-pre_*``, from the ``_collect-f`` collections) are not touched.
 
     python scripts/pretrain_selector_checkpoints.py [--datasets bbbp-m70 tri-40 ...]
+
+``--v2``: protocol v2 (no padding, ``lab/config/v2``): collections in ``lab/output/selector_pretrain/v2/``,
+checkpoints in ``models/pretrained/v2/``, settings from the v2 selector_v1 configs (scripts/gen_v2_configs.py).
+``--features`` (with ``--v2``): the arms with BLS-F substitutions, collections ``<cell>_collect2f-f<c>.pt`` and
+checkpoints ``edge_selector_sel2f-pre_<cell>-f<c>.pt``, settings from the ``dce-lcls-sel-v1-f`` configs.
+``--dcem`` (with ``--features``): the same arms on DCEM seeds (phase 1, 2026-11-08), collections
+``<cell>_collect2fm-f<c>.pt``, checkpoints ``edge_selector_sel2fm-pre_<cell>-f<c>.pt``, settings from ``dcm-lcls-sel-v1-f``.
 """
 from __future__ import annotations
 
@@ -25,18 +32,34 @@ from gen_selector_paper_matrix import CKPT_PREFIX, COLLECT_FOLDS, COLLECT_NAME, 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--datasets", nargs="+", default=cells())
+    ap.add_argument("--v2", action="store_true", help="protocol v2 collections, checkpoints and configs")
+    ap.add_argument("--features", action="store_true", help="the arms with BLS-F substitutions (protocol v2 only)")
+    ap.add_argument("--dcem", action="store_true", help="the BLS-F arms on DCEM seeds (needs --features)")
     args = ap.parse_args()
+    if args.features and not args.v2:
+        ap.error("--features needs --v2")
+    if args.dcem and not args.features:
+        ap.error("--dcem needs --features")
+    collect_name, ckpt_prefix, sel1, gen = COLLECT_NAME, CKPT_PREFIX, SEL1, "dce"
+    if args.features:
+        collect_name, ckpt_prefix, sel1 = COLLECT_NAME + "f", CKPT_PREFIX.replace("sel2-pre", "sel2f-pre"), SEL1 + "-f"
+    if args.dcem:
+        collect_name, ckpt_prefix, sel1, gen = COLLECT_NAME + "fm", CKPT_PREFIX.replace("sel2-pre", "sel2fm-pre"), \
+            SEL1.replace("dce-", "dcm-", 1) + "-f", "dcm"
+    sub = "v2/" if args.v2 else ""
+    tree = "lab/config/v2/generate_minimize" if args.v2 else "lab/config/generate_minimize"
     built, waiting = 0, []
     for ds in args.datasets:
         for c in COLLECT_FOLDS:
-            examples = REPO / f"lab/output/selector_pretrain/{ds}_{COLLECT_NAME}-f{c}.pt"
-            out = REPO / f"models/pretrained/{CKPT_PREFIX}_{ds}-f{c}.pt"
+            examples = REPO / f"lab/output/selector_pretrain/{sub}{ds}_{collect_name}-f{c}.pt"
+            out = REPO / f"models/pretrained/{sub}{ckpt_prefix}_{ds}-f{c}.pt"
             if out.exists():
                 continue
             if not examples.exists():
                 waiting.append(f"{ds} fold {c}")
                 continue
-            config = REPO / f"lab/config/generate_minimize/{ds}-sel/dce/{SEL1}/generate_minimize0.jsonc"
+            config = REPO / f"{tree}/{ds}-sel/{gen}/{sel1}/generate_minimize0.jsonc"
+            out.parent.mkdir(parents=True, exist_ok=True)
             print(f"== {ds}, collection of fold {c} -> {out.relative_to(REPO)}")
             subprocess.run([sys.executable, str(REPO / "scripts/pretrain_selector_v3.py"), "--examples", str(examples),
                             "--config", str(config), "--out", str(out), "--report", str(out.with_suffix(".json"))],
