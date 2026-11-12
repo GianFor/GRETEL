@@ -370,6 +370,8 @@ def fleet(runs, maximum, dry_run=False):
                        f'--array=0-{len(part) - 1}%{maximum}', f'--job-name=pm-{name[:3]}-{run.name}', export]
                 cmd += (['--partition=' + settings.get('cpu_partition', 'normal'), '--gres=none'] if cpu else
                         [f'--{o}=' + settings[o] for o in ('partition', 'gres') if o in settings])
+                if 'node' in settings and not cpu:
+                    cmd.append('--nodelist=' + settings['node'])
                 after = previous_generators if name == 'generators' else generators_job
                 if after:
                     cmd.append('--dependency=afterany:' + after)
