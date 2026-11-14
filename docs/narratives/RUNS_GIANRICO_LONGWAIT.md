@@ -40,7 +40,24 @@ test -d "$source"
 test -f "$config"
 mkdir -p lab/output/logs
 sbatch --wait -p normal scripts/slurm_matrix_prepare.sh "$config" "$run" "$source"
-python3 scripts/paper_probe_matrix.py fleet --max 1 --run-root "$run"
+conda run --no-capture-output -n GRTL python scripts/paper_probe_matrix.py fleet --max 1 --run-root "$run"
+BASH
+```
+
+Il launcher deve usare il Python di `GRTL`: il `python3` del login node è
+Python 3.6 e fallisce già in `argparse`, prima di inviare gli array.
+Se il prepare è riuscito e il launcher si è fermato con quell'errore, riprendere
+senza ripetere il prepare:
+
+```bash
+cd ~/GRETEL && bash <<'BASH'
+set -euo pipefail
+export WAIT_STEP=300 SKIP_GPU_WAIT=0
+run=lab/output/results/narr-matrix/tcr64-20b-h200-longwait
+test -f "$run/matrix.json"
+test ! -e "$run/jobs.jsonl"
+conda run --no-capture-output -n GRTL python scripts/paper_probe_matrix.py fleet --max 1 --run-root "$run"
+squeue -u "$USER"
 BASH
 ```
 
