@@ -2,7 +2,7 @@
 
 Prima parte della matrice concordata, sui 100 dump Tree-Cycles già congelati. Usa Qwen3.5-9B per generare e GPT-OSS-20B per i probe Reconstruction, Consistency e Recourse definiti nella matrice H200. Gli altri narratori, GLM, lo sweep Recourse e l'autovalutazione restano da eseguire.
 
-Il budget vLLM è 0.30 della memoria totale della H200, circa 42 GiB, con una sequenza simultanea. Il precedente smoke Qwen 9B aveva generato con circa 40 GiB di budget. La valutazione GPT-OSS-20B con questi prompt e questo budget richiede ancora verifica sul nodo. Il limite di output è 4.096 token, il contesto massimo 40.960. Il launcher attende fino a 30 minuti per almeno 45.000 MiB liberi, controllando ogni minuto.
+Il budget vLLM è 0.30 della memoria totale della H200, circa 42 GiB, con una sequenza simultanea. Il precedente smoke Qwen 9B aveva generato con circa 40 GiB di budget. La valutazione GPT-OSS-20B con questi prompt e questo budget richiede ancora verifica sul nodo. Il limite di output è 4.096 token, il contesto massimo 40.960. Il launcher attende fino a 12 ore per almeno 45.000 MiB liberi, controllando ogni minuto.
 
 ## Lancio da Caliban
 
@@ -28,3 +28,14 @@ python scripts/paper_probe_matrix.py summary --run-root "$run"
 Per Rodrigo raccogli `matrix-summary.csv`, `generated/qwen3.5-9b/generation.json` e l'output di `sacct`. Verifica gli stati di parsing e la copertura anche quando Slurm riporta `COMPLETED`. Il riepilogo può essere generato durante la run per controllare risultati parziali.
 
 Gli ID di questa sottomissione sono in `Submission/jobs.txt`. Questo launcher usa sottomissioni dirette e registra i job in quel file. Per le run create da questo launcher, usa i tre ID stampati per monitorare e riprovare eventuali job falliti.
+
+Il limite totale di ogni job GPU è 24 ore e include il controllo della VRAM. Dopo 12 ore di attesa rimangono circa 12 ore per caricamento e inferenza. La coda Slurm precede questo intervallo. Il nuovo limite del launcher si applica alle nuove sottomissioni.
+
+Per sostituire i due job GPU ancora pending della sottomissione del 14 novembre, riutilizzando il prepare, eseguire dopo il pull.
+
+```bash
+bash scripts/launch_tcr_9b_20b_h200.sh --replace-pending \
+  lab/output/logs/tcr-9b-20b-h200-WX6mBG
+```
+
+Il comando mette temporaneamente in hold i due job e verifica che siano entrambi pending. In caso diverso rilascia gli hold e si ferma. Quando entrambi sono pending, li annulla e invia due sostituti con l'attesa di 12 ore, registrando gli ID in `jobs.txt`. Se una sottomissione fallisce, controllare gli ID già registrati prima di riprovare. Il manifest del prepare originario conserva la configurazione iniziale, mentre `jobs.txt` registra il nuovo limite effettivo passato ai job GPU. [Comandi hold e release di Slurm](https://slurm.schedmd.com/scontrol.html)
